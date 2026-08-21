@@ -405,6 +405,23 @@ class TestApi:
             assert r.status_code == 404
         store.close()
 
+    def test_devices_expose_omlx_admin_url(self):
+        # The overview links straight to each device's omlx admin dashboard;
+        # devices without omlx must advertise no link at all.
+        cfg = Config(devices=[
+            Device(name="Serving", host="h", omlx_port=8080),
+            Device(name="Headless", host="m", omlx_port=None),
+        ])
+        store = Store.in_memory()
+        app = create_app(cfg, store, {d.id: DeviceState(d) for d in cfg.devices}, start_pollers=False)
+        with TestClient(app) as client:
+            devs = {d["id"]: d for d in client.get("/api/devices").json()}
+            assert devs["serving"]["omlx_admin_url"] == "http://h:8080/admin"
+            assert devs["serving"]["has_omlx"] is True
+            assert devs["headless"]["omlx_admin_url"] is None
+            assert devs["headless"]["has_omlx"] is False
+        store.close()
+
     def test_static_assets_disable_caching(self):
         # A stale cached app.js keeps old bugs alive after a refresh; assets
         # must always be revalidated against the hub.

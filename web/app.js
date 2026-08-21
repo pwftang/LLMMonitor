@@ -224,6 +224,7 @@ const ICONS = {
   fan: '<circle cx="12" cy="12" r="1.8" fill="currentColor"/><path d="M12 10c-1-2 .5-4.5.5-4.5C16 5.5 17 9 13 10m2 1.5c2.2-.5 4.5 1.5 4.5 1.5-1 3.5-4.7 3.1-6 .5m-3.5-.5c-1.2 2-4.6 2-4.6 2 0-3.6 3.3-4.9 5.3-3.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
   sun: '<circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
   moon: '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
+  ext: '<path d="M13.5 4H20v6.5M20 4 10.8 13.2M9 5H6.5A2.5 2.5 0 0 0 4 7.5v10A2.5 2.5 0 0 0 6.5 20h10a2.5 2.5 0 0 0 2.5-2.5V15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>',
 };
 const icon = (name) =>
   `<svg viewBox="0 0 24 24"${name === "sun" || name === "moon" ? ' fill="none"' : ""} aria-hidden="true">${ICONS[name] || ICONS.box}</svg>`;
@@ -282,6 +283,9 @@ async function renderOverview() {
       <div class="card-head">
         <span class="status-dot"></span>
         <h2>${esc(d.name)} <span class="omlx-ver"></span></h2>
+        ${d.omlx_admin_url
+          ? `<a class="icon-btn card-admin" href="${esc(d.omlx_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx admin dashboard" aria-label="open omlx admin dashboard">${icon("ext")}</a>`
+          : ""}
         <span class="card-state"></span>
       </div>
       <div class="card-body">
@@ -328,6 +332,9 @@ async function renderOverview() {
       </div>
     `;
     grid.appendChild(card);
+
+    const adminLink = card.querySelector(".card-admin");
+    if (adminLink) adminLink.addEventListener("click", (e) => e.stopPropagation());
 
     const dotEl = card.querySelector(".status-dot");
     const stateEl = card.querySelector(".card-state");
@@ -531,18 +538,20 @@ async function renderDetail(id, initialRange = "1h") {
     });
 
     const charts = {};
+    const statsEls = {};
     const panelsDiv = view.querySelector("#panels");
     for (const p of panels) {
       const div = document.createElement("div");
       div.className = "panel";
       const right = d.has_omlx === false && p.omlx ? `<span class="head-right">no oMLX</span>` : "";
-      div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas></div>`;
+      div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas><div class="chart-stats"></div></div>`;
       panelsDiv.appendChild(div);
       charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt });
       liveCharts.push(charts[p.title]);
+      statsEls[p.title] = div.querySelector(".chart-stats");
     }
 
-    return { d, charts };
+    return { d, charts, statsEls };
   }
 
   let ctx;
@@ -665,6 +674,8 @@ async function renderDetail(id, initialRange = "1h") {
         }
       }
       ctx.charts[p.title].setSeries(list);
+      const statsEl = ctx.statsEls[p.title];
+      if (statsEl) statsEl.innerHTML = chartStatsHTML(list, p.fmt);
     }
   }
 
@@ -682,6 +693,20 @@ async function renderDetail(id, initialRange = "1h") {
 /* ---------- small helpers ---------- */
 function stat(label, value, cls = "") {
   return `<div class="stat"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`;
+}
+function chartStatsHTML(list, fmt) {
+  // per-series avg/peak over the currently displayed range; the chip index
+  // spans every series (empty included) so its colour matches the chart line
+  const chips = [];
+  list.forEach((s, i) => {
+    if (!s.data.length) return;
+    let sum = 0, peak = -Infinity;
+    for (const [, v] of s.data) { sum += v; if (v > peak) peak = v; }
+    chips.push(
+      `<span class="cs"><span class="cs-dot" style="background:var(--chart-${(i % 9) + 1})"></span>${esc(s.label)} <b>avg ${fmt(sum / s.data.length)} · peak ${fmt(peak)}</b></span>`
+    );
+  });
+  return chips.join("");
 }
 function num0(v) {
   return v == null ? "—" : String(v);

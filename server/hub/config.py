@@ -130,8 +130,10 @@ def _resolve(base: Path, p: str | os.PathLike) -> Path:
 
 
 def _mock_devices() -> list[Device]:
+    # omlx_port is nominal — MockPoller never makes HTTP calls; it exists so
+    # the payload mirrors a real device (has_omlx, omlx_admin_url).
     return [
-        Device(name="Mock Studio A", host="127.0.0.1", omlx_port=None, macmon_port=None),
-        Device(name="Mock Studio B", host="127.0.0.1", omlx_port=None, macmon_port=None),
-        Device(name="Mock MacBook", host="127.0.0.1", omlx_port=None, macmon_port=None),
+        Device(name="Mock Studio A", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
+        Device(name="Mock Studio B", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
+        Device(name="Mock MacBook", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
     ]

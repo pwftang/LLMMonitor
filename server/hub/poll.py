@@ -158,12 +158,14 @@ class DeviceState:
         self.last_seen = time.time()
 
     def public(self) -> dict:
+        base = self.device.omlx_base
         return {
             "id": self.device.id,
             "name": self.device.name,
             "host": self.device.host,
-            "has_omlx": self.device.omlx_base is not None,
+            "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
+            "omlx_admin_url": f"{base}/admin" if base else None,
             "online": self.online,
             "last_error": self.last_error,
             "last_seen": self.last_seen,
