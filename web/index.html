@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLMMonitor</title>
+  <script>
+    // Apply the saved theme before first paint to avoid a light/dark flash.
+    (function () {
+      var t = localStorage.getItem("llmmonitor-theme");
+      if (t !== "light" && t !== "dark")
+        t = window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+      document.documentElement.dataset.theme = t;
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header id="topbar">
+    <span class="logo">⬡</span>
+    <h1>LLMMonitor</h1>
+    <button id="theme-toggle" class="icon-btn" title="Toggle light/dark theme" aria-label="Toggle theme"></button>
+    <span id="hub-status" class="hub-status"></span>
+  </header>
+  <main id="view"></main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

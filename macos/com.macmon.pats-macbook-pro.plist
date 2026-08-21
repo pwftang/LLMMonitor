@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.macmon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/macmon</string>
+    <string>serve</string>
+    <string>--host</string>
+    <string>100.91.150.110</string>
+    <string>-p</string>
+    <string>9090</string>
+    <string>-i</string>
+    <string>1000</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/macmon.log</string>
+  <key>StandardErrorPath</key><string>/tmp/macmon.log</string>
+</dict>
+</plist>

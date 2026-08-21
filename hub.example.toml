@@ -1,0 +1,45 @@
+# LLMMonitor hub configuration. Copy to hub.toml and fill in your devices.
+
+bind = "0.0.0.0"            # hub listen address — keep loopback unless you want to
+port = 8400                 #   browse from other tailnet devices (then use this box's tailnet IP)
+data_dir = "./data"         # SQLite lives here (relative to this config file)
+# web_dir = "./web"         # only needed if you move the frontend; defaults to the
+                            # bundled web/ directory
+
+poll_interval = 2           # seconds between macmon + omlx /stats polls
+models_interval = 5         # seconds between omlx /models polls
+offline_backoff = 30        # seconds to wait before retrying an offline device
+request_timeout = 5         # seconds per HTTP request
+
+[retention]
+full_res_hours = 24         # keep raw 2s samples this long
+rollup_days = 30            # keep 5-minute rollups this long
+rollup_seconds = 300        # rollup bucket size
+
+# One [[devices]] block per machine.
+# name      — display name
+# host      — Tailscale hostname or 100.x.y.z IP
+# omlx_port — omlx admin port (default 8080); omit omlx entirely for non-serving machines
+# macmon_port — macmon serve port (default 9090)
+# api_key   — omlx API key (omit if the server has no key configured)
+
+[[devices]]
+name = "Mac Studio M2 Ultra"
+host = "mac-studio-m2-ultra.tailc08855.ts.net"
+omlx_port = 8080
+macmon_port = 9090
+api_key = "your-omlx-api-key-here"
+
+[[devices]]
+name = "Mac Studio M2 Max"
+host = "patricks-mac-studio.tailc08855.ts.net"
+omlx_port = 8080
+macmon_port = 9090
+api_key = "your-omlx-api-key-here"
+
+[[devices]]
+name = "MacBook Pro"
+host = "pats-macbook-pro.tailc08855.ts.net"
+omlx_port = 8080
+macmon_port = 9090
+api_key = "your-omlx-api-key-here"

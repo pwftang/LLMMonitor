@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.macmon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>exec /opt/homebrew/bin/macmon serve --host $(TS=$( (command -v tailscale; ls /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale 2>/dev/null; echo tailscaled-missing) | head -1 ); $TS ip -4 | head -1) -p 9090 -i 1000</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/macmon.log</string>
+  <key>StandardErrorPath</key><string>/tmp/macmon.log</string>
+</dict>
+</plist>
