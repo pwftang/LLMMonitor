@@ -58,9 +58,11 @@ export class Chart {
   }
 
   setSeries(series) {
-    // series: [{label, data:[[ts,v],...], color?}] — series without an
+    // series: [{label, data:[[ts,v],...], color?, band?}] — series without an
     // explicit colour resolve from the theme palette at draw time, so a
-    // theme toggle recolours them without re-setting data.
+    // theme toggle recolours them without re-setting data. band is an
+    // optional {min: [[ts,v],...], max: [[ts,v],...]} pair drawn as a
+    // shaded envelope behind the line (rollup min/max).
     this.series = series.map((s, i) => ({ _ci: i, ...s }));
     this.draw();
   }
@@ -78,6 +80,9 @@ export class Chart {
         if (t < tMin) tMin = t;
         if (t > tMax) tMax = t;
         if (v > yMax) yMax = v;
+      }
+      if (s.band) {
+        for (const [, v] of s.band.max) if (v > yMax) yMax = v;
       }
     }
     if (!isFinite(tMin)) return null;
@@ -148,7 +153,21 @@ export class Chart {
     for (const s of this.series) {
       if (s.data.length === 0) continue;
       const color = this._color(s);
-      if (this.opts.fill) {
+      const hasBand = s.band && s.band.min.length && s.band.max.length;
+      if (hasBand) {
+        // rollup min/max envelope, drawn as a polygon: max forward, min back
+        ctx.beginPath();
+        const mx = s.band.max, mn = s.band.min;
+        ctx.moveTo(x(mx[0][0]), y(mx[0][1]));
+        for (const [t, v] of mx) ctx.lineTo(x(t), y(v));
+        for (let i = mn.length - 1; i >= 0; i--) ctx.lineTo(x(mn[i][0]), y(mn[i][1]));
+        ctx.closePath();
+        ctx.globalAlpha = 0.18;
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+      if (this.opts.fill && !hasBand) {
         ctx.beginPath();
         ctx.moveTo(x(s.data[0][0]), y(this.opts.ymin));
         for (const [t, v] of s.data) ctx.lineTo(x(t), y(v));

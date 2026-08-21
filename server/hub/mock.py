@@ -30,12 +30,20 @@ MODELS = [
     ("mlx-community/Qwen2.5-Coder-14B-8bit", 15.1),
 ]
 
+# Installed but never loaded — exercises the "Available models" drill-down panel.
+AVAILABLE_MODELS = [
+    ("mlx-community/Gemma-3-12B-4bit", 7.3),
+    ("mlx-community/Phi-4-14B-4bit", 8.9),
+    ("mlx-community/Mistral-Small-3.2-24B-6bit", 19.2),
+]
+
 
 class MockPoller:
     def __init__(self, device: Device, cfg: Config, store: Store, state: DeviceState):
         self.device, self.cfg, self.store, self.state = device, cfg, store, state
         rng = random.Random(device.id)
         random.Random()  # keep global rng for simplicity of interpolated phases
+        self.available = AVAILABLE_MODELS
         self.phase = rng.uniform(0, 10)
         self.cpu = _Walk(0.02, 0.95, 0.15, 0.06)
         self.gpu = _Walk(0.0, 1.0, 0.3, 0.10)
@@ -158,6 +166,15 @@ class MockPoller:
                 "actual_size": entry["actual_size"],
                 "pinned": entry["pinned"],
                 "active_requests": entry["active_requests"],
+            })
+        for name, gb in self.available:
+            payload.append({
+                "id": name,
+                "loaded": False,
+                "is_loading": False,
+                "actual_size": int(gb * 1024**3),
+                "pinned": False,
+                "active_requests": 0,
             })
         return payload, am_models
 

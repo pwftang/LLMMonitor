@@ -18,10 +18,13 @@ class Device:
     omlx_port: int | None = 8000
     macmon_port: int | None = 9090
     api_key: str | None = None
+    # Optional stable id; defaults to a slug of `name`. Set explicitly so a
+    # display-name change doesn't orphan this device's stored history.
+    id: str | None = None
 
-    @property
-    def id(self) -> str:
-        return _slug(self.name)
+    def __post_init__(self) -> None:
+        if not self.id:
+            self.id = _slug(self.name)
 
     @property
     def macmon_url(self) -> str | None:
@@ -105,6 +108,7 @@ def load(path: str | os.PathLike | None = None) -> Config:
             omlx_port=d.get("omlx_port"),
             macmon_port=d.get("macmon_port"),
             api_key=d.get("api_key"),
+            id=d.get("id"),
         )
         for d in raw.get("devices", [])
     ]
@@ -116,7 +120,7 @@ def load(path: str | os.PathLike | None = None) -> Config:
 
     ids = [d.id for d in cfg.devices]
     if len(ids) != len(set(ids)):
-        raise SystemExit("Duplicate device ids (derived from names) in config")
+        raise SystemExit("Duplicate device ids in config")
     return cfg
 
 

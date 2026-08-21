@@ -243,14 +243,22 @@ a { color: var(--blue); text-decoration: none; }
 /* ---------- overview ---------- */
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
   gap: 14px;
+  /* break out of #view's 1500px cap so overview cards span the browser width */
+  width: calc(100vw - 36px);
+  margin-left: calc(50% - 50vw + 18px);
 }
 
+/* subgrid rows align matching .ov-sec panels across all device cards in a row */
 .card {
   padding: 0;
   cursor: pointer;
   overflow: hidden;
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 5;
+  row-gap: 0;
 }
 .card:hover { border-color: var(--muted); }
 .card.offline { opacity: 0.55; cursor: default; }
@@ -276,7 +284,13 @@ a { color: var(--blue); text-decoration: none; }
 .card-state { font-size: 11.5px; font-weight: 500; }
 .omlx-ver { font-size: 10px; font-weight: 400; color: var(--text-3); letter-spacing: 0.2px; }
 
-.card-body { padding: 14px 16px 12px; background: var(--bg); }
+.card-body {
+  padding: 14px 16px 12px;
+  background: var(--bg);
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 4;
+}
 
 .ov-sec {
   background: var(--surface);

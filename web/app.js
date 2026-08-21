@@ -5,11 +5,9 @@ const hubStatus = document.getElementById("hub-status");
 
 /* ---------- formatting ---------- */
 const fmtGB = (v) => (v == null ? "—" : `${v.toFixed(1)} GB`);
-const fmtW = (v) => (v == null ? "—" : `${v.toFixed(1)} W`);
 const fmtPct = (v) => (v == null ? "—" : `${(v * 100).toFixed(0)}%`);
 const fmtPct100 = (v) => (v == null ? "—" : `${v.toFixed(0)}%`);
 const fmtTemp = (v) => (v == null ? "—" : `${v.toFixed(1)}°C`);
-const fmtRPM = (v) => (v == null ? "—" : `${Math.round(v).toLocaleString()} rpm`);
 const fmtTps = (v) => (v == null ? "—" : `${v.toFixed(1)} t/s`);
 const tokParts = (v) =>
   v == null ? null
@@ -56,13 +54,17 @@ function setStatus(text, isErr = false) {
 }
 
 /* ---------- routing ---------- */
+const RANGES = ["1h", "3h", "6h", "24h", "7d", "30d"];
 function route() {
   clearTimers();
   disposeCharts();
   routeGen += 1;
-  const m = location.hash.match(/^#\/device\/(.+)$/);
-  if (m) renderDetail(decodeURIComponent(m[1]));
-  else renderOverview();
+  // #/device/<id> or #/device/<id>/<range> (range defaults to 1h)
+  const m = location.hash.match(/^#\/device\/([^/]+?)(?:\/(\w+))?\/?$/);
+  if (m) {
+    const range = m[2] && RANGES.includes(m[2]) ? m[2] : "1h";
+    renderDetail(decodeURIComponent(m[1]), range);
+  } else renderOverview();
 }
 window.addEventListener("hashchange", route);
 
@@ -88,8 +90,6 @@ const LIVE_GROUPS = [
   ["system", "cpu", [
     ["cpu / gpu", (s) => `${fmtPct(val(s, "sys.cpu_util"))} / ${fmtPct(val(s, "sys.gpu_util"))}`],
     ["temps", (s) => `${fmtTemp(val(s, "sys.cpu_temp_c"))} / ${fmtTemp(val(s, "sys.gpu_temp_c"))}`],
-    ["power", (s) => fmtW(val(s, "sys.sys_power_w"))],
-    ["fan", (s) => fmtRPM(val(s, "sys.fan_rpm_max"))],
     ["last seen", (s, llm, d) => (d.online ? "now" : ago(d.last_seen))],
   ]],
 ];
@@ -185,17 +185,30 @@ function modelRowsHTML(models, detail = false) {
     .join("")}</div>`;
 }
 
+function availableModels(d) {
+  const all = Array.isArray(d.raw?.omlx_models) ? d.raw.omlx_models : [];
+  return all.filter((m) => !isLiveModel(m));
+}
+
+function availRowsHTML(models) {
+  if (!models.length) return `<div class="rows"><div class="m-none">no models available</div></div>`;
+  return `<div class="rows">${models
+    .map((m) => `<div class="row">
+      <div class="m-main">
+        <span class="m-name">${esc(modelName(m))}</span>
+        ${m.engine_type ? `<span class="m-meta">${esc(m.engine_type)}</span>` : ""}
+      </div>
+      <div class="m-right">
+        <span class="m-size">${modelMem(m)}</span>
+      </div>
+    </div>`)
+    .join("")}</div>`;
+}
+
 function hwLineHTML(s, llm) {
   if (!s || Object.keys(s).length === 0) return "";
-  const pwr = val(s, "sys.sys_power_w");
-  const fan = val(s, "sys.fan_rpm_max");
   const wait = val(llm, "llm.waiting_reqs");
-  const bits = [
-    pwr != null ? `<b>${pwr.toFixed(1)} W</b>` : null,
-    fan != null ? `${Math.round(fan).toLocaleString()} rpm` : null,
-    wait != null && wait > 0 ? `${num0(wait)} queued` : null,
-  ].filter(Boolean);
-  return bits.join(" · ");
+  return wait != null && wait > 0 ? `${num0(wait)} queued` : "";
 }
 
 /* ---------- icons + theme ---------- */
@@ -213,7 +226,7 @@ const ICONS = {
   moon: '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
 };
 const icon = (name) =>
-  `<svg viewBox="0 0 24 24${name === "sun" || name === "moon" ? " fill=\"none\"" : ""}" aria-hidden="true">${ICONS[name] || ICONS.box}</svg>`;
+  `<svg viewBox="0 0 24 24"${name === "sun" || name === "moon" ? ' fill="none"' : ""} aria-hidden="true">${ICONS[name] || ICONS.box}</svg>`;
 function panelIcon(title) {
   const t = title.toLowerCase();
   if (t.includes("power")) return icon("zap");
@@ -449,9 +462,10 @@ async function renderOverview() {
 }
 
 /* ---------- detail ---------- */
-async function renderDetail(id) {
-  let range = "1h";
+async function renderDetail(id, initialRange = "1h") {
+  let range = initialRange;
   let lastModelsHTML = "";
+  let lastAvailHTML = "";
   const gen = routeGen;
   disposeCharts();
   view.innerHTML = `<div class="empty">loading…</div>`;
@@ -478,7 +492,7 @@ async function renderDetail(id) {
         <a class="back" href="#">&larr; all devices</a>
         <h2>${esc(d.name)}</h2>
         <span class="d-state"><span class="status-dot"></span><span class="d-state-text"></span></span>
-        <div class="segments">${["1h", "3h", "6h", "24h", "7d", "30d"]
+        <div class="segments">${RANGES
           .map((r) => `<button data-r="${r}" class="${r === range ? "active" : ""}">${r}</button>`)
           .join("")}</div>
       </div>
@@ -495,6 +509,10 @@ async function renderDetail(id) {
       <div class="panel wide" style="margin-top:14px">
         <div class="panel-head">${icon("box")}<span class="kicker">Loaded models</span></div>
         <div class="panel-body" id="models-table"></div>
+      </div>
+      <div class="panel wide" style="margin-top:14px">
+        <div class="panel-head">${icon("database")}<span class="kicker">Available models</span></div>
+        <div class="panel-body" id="avail-models"></div>
       </div>`;
     view.innerHTML = head;
     view.querySelector("#big").innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
@@ -502,7 +520,14 @@ async function renderDetail(id) {
       `<div class="panel live-group"><div class="panel-head">${icon(iconName)}<span class="kicker">${title}</span></div><div class="live-group-body">${stats.map(([label]) => stat(label, "")).join("")}</div></div>`
     ).join("");
     view.querySelectorAll(".segments button").forEach((b) => {
-      b.onclick = () => { range = b.dataset.r; view.querySelectorAll(".segments button").forEach((x) => x.classList.toggle("active", x === b)); refreshCharts(); };
+      b.onclick = () => {
+        range = b.dataset.r;
+        view.querySelectorAll(".segments button").forEach((x) => x.classList.toggle("active", x === b));
+        refreshCharts();
+        // replaceState, not location.hash — assigning the hash would fire
+        // hashchange and rebuild the whole view
+        history.replaceState(null, "", `#/device/${encodeURIComponent(id)}/${range}`);
+      };
     });
 
     const charts = {};
@@ -586,6 +611,15 @@ async function renderDetail(id) {
           tbl.innerHTML = html;
         }
       }
+
+      const avail = view.querySelector("#avail-models");
+      if (avail) {
+        const html = availRowsHTML(availableModels(d));
+        if (html !== lastAvailHTML) {
+          lastAvailHTML = html;
+          avail.innerHTML = html;
+        }
+      }
     } catch {
       // keep previous values on transient error
     }
@@ -609,11 +643,22 @@ async function renderDetail(id) {
     const all = [...wanted];
     const h = await api(`/api/devices/${id}/history?metrics=${all.join(",")}&range=${range}`);
     const series = h.series;
+    const bands = h.bands || {};
+    const scaleBand = (b, mul) => (b == null ? null : {
+      min: b.min.map(([t, v]) => [t, v * mul]),
+      max: b.max.map(([t, v]) => [t, v * mul]),
+    });
     for (const p of panels) {
-      const list = p.metrics.map((m, i) => ({
-        label: p.labels[i],
-        data: p.pct ? (series[m] || []).map(([t, v]) => [t, v * 100]) : series[m] || [],
-      }));
+      const mul = p.pct ? 100 : 1;
+      const list = p.metrics.map((m, i) => {
+        const s = {
+          label: p.labels[i],
+          data: mul !== 1 ? (series[m] || []).map(([t, v]) => [t, v * mul]) : series[m] || [],
+        };
+        const band = scaleBand(bands[m], mul);
+        if (band) s.band = band;
+        return s;
+      });
       if (p.dynamic === "models") {
         for (const [m, label] of modelMetrics) {
           list.push({ label, data: series[m] || [] });

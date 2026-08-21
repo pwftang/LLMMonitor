@@ -205,6 +205,33 @@ class TestStore:
         assert len(s.history("dev", ["x"], now - 5000, now)["x"]) <= MAX_POINTS
         s.close()
 
+    def test_rollup_bands(self):
+        s = self._store()
+        t0 = 1_700_000_000.0
+        now = t0 + 3 * 3600
+        for i, v in enumerate([10.0, 99.0, 3.0]):
+            s.insert("dev", t0 + i, "system", {"sys.cpu_util": v})
+        s.commit()
+        s.rollup_and_prune(now=now)
+        # samples land in the bucket starting at t0-200; query must include it
+        series, bands = s.history_with_bands("dev", ["sys.cpu_util"], t0 - 300, now)
+        # one 5-minute bucket covered all three samples
+        assert [round(v) for _, v in series["sys.cpu_util"]] == [round((10.0 + 99.0 + 3.0) / 3)]
+        b = bands["sys.cpu_util"]
+        assert [v for _, v in b["min"]] == [3.0]
+        assert [v for _, v in b["max"]] == [99.0]
+        assert len(b["min"]) == 1 and len(b["max"]) == 1
+        s.close()
+
+    def test_full_res_history_has_no_bands(self):
+        s = self._store()
+        now = time.time()
+        s.insert("dev", now - 10, "system", {"x": 1.0})
+        s.commit()
+        _, bands = s.history_with_bands("dev", ["x"], now - 60, now)
+        assert bands == {}
+        s.close()
+
 
 class TestConfig:
     def test_load(self, tmp_path):
@@ -245,6 +272,15 @@ macmon_port = 9091
         assert d1.macmon_url == "http://studio-1.ts.net:9090/json"
         assert d2.omlx_base is None  # omlx_port 0 → disabled
         assert d2.macmon_url == "http://mini.ts.net:9091/json"
+
+    def test_device_id_override(self, tmp_path):
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "Mac Studio"\nhost = "x"\nid = "studio"\n'
+            '[[devices]]\nname = "No Id"\nhost = "y"\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        assert cfg.devices[0].id == "studio"
+        assert cfg.devices[1].id == "no-id"
 
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
@@ -387,8 +423,32 @@ class TestApi:
             assert r.status_code == 200
             series = r.json()["series"]["sys.cpu_util"]
             assert [round(v, 1) for _, v in series] == [0.4, 0.6]
+            assert r.json()["bands"] == {}
             r = client.get("/api/devices/studio-one/history?metrics=&range=1h")
             assert r.status_code == 400
             r = client.get("/api/devices/studio-one/history?metrics=x&range=bogus")
             assert r.status_code == 400
+        store.close()
+
+    def test_history_bands_from_rollups(self):
+        cfg = Config(devices=[Device(name="Studio One", host="h")])
+        store = Store.in_memory(Retention(full_res_hours=1, rollup_days=30 * 365))
+        states = {d.id: DeviceState(d) for d in cfg.devices}
+        t0 = 1_700_000_000.0
+        store.insert("studio-one", t0, "system", {"sys.cpu_util": 1.0})
+        store.insert("studio-one", t0 + 60, "system", {"sys.cpu_util": 5.0})
+        store.commit()
+        store.rollup_and_prune(now=t0 + 2 * 3600)
+        app = create_app(cfg, store, states, start_pollers=False)
+        with TestClient(app) as client:
+            r = client.get(
+                f"/api/devices/studio-one/history"
+                f"?metrics=sys.cpu_util&from_ts={t0 - 300}&to_ts={t0 + 3600}"
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert [round(v) for _, v in body["series"]["sys.cpu_util"]] == [3]
+            band = body["bands"]["sys.cpu_util"]
+            assert [v for _, v in band["min"]] == [1.0]
+            assert [v for _, v in band["max"]] == [5.0]
         store.close()

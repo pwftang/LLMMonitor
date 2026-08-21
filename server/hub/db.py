@@ -114,24 +114,40 @@ class Store:
         self, device: str, metrics: Iterable[str], from_ts: float, to_ts: float
     ) -> dict[str, list[list[float]]]:
         """Return {metric: [[ts, value], ...]}, sourcing rollups or samples."""
+        return self.history_with_bands(device, metrics, from_ts, to_ts)[0]
+
+    def history_with_bands(
+        self, device: str, metrics: Iterable[str], from_ts: float, to_ts: float
+    ) -> tuple[dict[str, list[list[float]]], dict[str, dict[str, list[list[float]]]]]:
+        """Return (series, bands). Bands carry per-bucket min/max and are only
+        available when the range falls back to 5-minute rollups; {} otherwise."""
         full_res_cutoff = time.time() - self.retention.full_res_hours * 3600
         if from_ts < full_res_cutoff:
             return self._history_rollups(device, metrics, from_ts, to_ts)
-        return self._history_samples(device, metrics, from_ts, to_ts)
+        return self._history_samples(device, metrics, from_ts, to_ts), {}
 
     def _history_rollups(self, device, metrics, from_ts, to_ts):
-        out: dict[str, list[list[float]]] = {m: [] for m in metrics}
+        series: dict[str, list[list[float]]] = {m: [] for m in metrics}
+        bands: dict[str, dict[str, list[list[float]]]] = {}
         placeholders = ",".join("?" for _ in metrics)
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT metric, bucket_ts, avg FROM rollups "
+                f"SELECT metric, bucket_ts, avg, min, max FROM rollups "
                 f"WHERE device = ? AND metric IN ({placeholders}) "
                 f"AND bucket_ts BETWEEN ? AND ? ORDER BY bucket_ts",
                 (device, *metrics, int(from_ts), int(to_ts)),
             ).fetchall()
-        for metric, bucket_ts, avg in rows:
-            out[metric].append([bucket_ts, avg])
-        return out
+        per_metric: dict[str, list[list[float]]] = {}
+        for metric, bucket_ts, avg, mn, mx in rows:
+            per_metric.setdefault(metric, []).append([bucket_ts, avg, mn, mx])
+        for metric, tuples in per_metric.items():
+            decimated = _decimate_bands(tuples, MAX_POINTS)
+            series[metric] = [[ts, avg] for ts, avg, _, _ in decimated]
+            bands[metric] = {
+                "min": [[ts, mn] for ts, _, mn, _ in decimated],
+                "max": [[ts, mx] for ts, _, _, mx in decimated],
+            }
+        return series, bands
 
     def _history_samples(self, device, metrics, from_ts, to_ts):
         wanted = set(metrics)
@@ -192,4 +208,21 @@ def _decimate(points: list[list[float]], max_points: int) -> list[list[float]]:
         ts = sum(p[0] for p in chunk) / len(chunk)
         v = sum(p[1] for p in chunk) / len(chunk)
         out.append([ts, v])
+    return out
+
+
+def _decimate_bands(rows: list[list[float]], max_points: int) -> list[list[float]]:
+    """Joint decimation of [ts, avg, min, max] rollup rows. Averages are
+    averaged, but min/max keep the true extrema so the band stays honest."""
+    if len(rows) <= max_points:
+        return rows
+    bucket_size = len(rows) / max_points
+    out = []
+    for i in range(max_points):
+        chunk = rows[int(i * bucket_size) : int((i + 1) * bucket_size)] or [rows[-1]]
+        ts = sum(r[0] for r in chunk) / len(chunk)
+        avg = sum(r[1] for r in chunk) / len(chunk)
+        mn = min(r[2] for r in chunk)
+        mx = max(r[3] for r in chunk)
+        out.append([ts, avg, mn, mx])
     return out

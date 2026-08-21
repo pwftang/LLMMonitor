@@ -18,6 +18,9 @@ rollup_seconds = 300        # rollup bucket size
 
 # One [[devices]] block per machine.
 # name      — display name
+# id        — optional stable id used for stored metrics; defaults to a slug of
+#             name. Set it if you may rename a device later, so its history
+#             stays attached to the same id.
 # host      — Tailscale hostname or 100.x.y.z IP
 # omlx_port — omlx admin port (default 8080); omit omlx entirely for non-serving machines
 # macmon_port — macmon serve port (default 9090)

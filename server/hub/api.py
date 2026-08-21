@@ -90,8 +90,8 @@ def create_app(cfg: Config, store: Store, states: dict[str, DeviceState], *, sta
             raise HTTPException(400, "no metrics requested")
         if len(metric_list) > 64:
             raise HTTPException(400, "too many metrics in one request")
-        data = store.history(dev_id, metric_list, from_ts, to_ts)
-        return JSONResponse({"device": dev_id, "from": from_ts, "to": to_ts, "series": data})
+        data, bands = store.history_with_bands(dev_id, metric_list, from_ts, to_ts)
+        return JSONResponse({"device": dev_id, "from": from_ts, "to": to_ts, "series": data, "bands": bands})
 
     web_dir = cfg.web_dir or cfg.default_web_dir()
     index = Path(web_dir) / "index.html"
