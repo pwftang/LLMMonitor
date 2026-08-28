@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -234,6 +235,43 @@ class TestStore:
         assert bands == {}
         s.close()
 
+    def test_history_merges_rollups_with_recent_samples(self):
+        # 7d/30d charts request from_ts far behind the full-res cutoff; the
+        # response must still end at the newest samples, not stop at the
+        # oldest rollup horizon.
+        s = self._store()  # full_res_hours=1
+        now = time.time()
+        old_bucket = int((now - 2 * 3600) // 300) * 300
+        s.insert("dev", old_bucket + 10, "system", {"x": 10.0})
+        s.insert("dev", old_bucket + 40, "system", {"x": 20.0})
+        s.insert("dev", now - 100, "system", {"x": 30.0})
+        s.insert("dev", now - 50, "system", {"x": 40.0})
+        s.commit()
+        stats = s.rollup_and_prune(now=now)
+        assert stats["rollups_written"] == 1
+        series, bands = s.history_with_bands("dev", ["x"], now - 3 * 3600, now)
+        values = [v for _, v in series["x"]]
+        assert values == [pytest.approx(15.0), 30.0, 40.0]
+        timestamps = [ts for ts, _ in series["x"]]
+        assert timestamps == sorted(timestamps)
+        assert bands["x"]["min"] == [[pytest.approx(float(old_bucket)), 10.0]]
+        assert bands["x"]["max"] == [[pytest.approx(float(old_bucket)), 20.0]]
+        s.close()
+
+    def test_history_past_range_uses_rollups_only(self):
+        # A range fully behind the rollup horizon must not touch raw samples.
+        s = self._store()
+        now = time.time()
+        for i in range(3):
+            s.insert("dev", now - 2 * 3600 + i, "system", {"x": float(i)})
+        s.commit()
+        s.rollup_and_prune(now=now)
+        horizon = int((now - 3600) // 300) * 300
+        series, bands = s.history_with_bands("dev", ["x"], now - 3 * 3600, horizon)
+        assert [round(v) for _, v in series["x"]] == [1]
+        assert bands["x"]["min"] and bands["x"]["max"]
+        s.close()
+
 
 class TestConfig:
     def test_load(self, tmp_path):
@@ -283,6 +321,17 @@ macmon_port = 9091
         cfg = load(tmp_path / "hub.toml")
         assert cfg.devices[0].id == "studio"
         assert cfg.devices[1].id == "no-id"
+
+    def test_device_ports_default_when_omitted(self, tmp_path):
+        # Omitting a port key must fall back to the defaults, not silently
+        # disable the source (a None port previously slipped past d.get()).
+        (tmp_path / "hub.toml").write_text('[[devices]]\nname = "Mac"\nhost = "x"\n')
+        cfg = load(tmp_path / "hub.toml")
+        (dev,) = cfg.devices
+        assert dev.omlx_port == 8000
+        assert dev.omlx_base == "http://x:8000"
+        assert dev.macmon_port == 9090
+        assert dev.macmon_url == "http://x:9090/json"
 
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
@@ -524,3 +573,45 @@ class TestApi:
             assert [v for _, v in band["min"]] == [1.0]
             assert [v for _, v in band["max"]] == [5.0]
         store.close()
+
+    def test_history_rejects_bad_bounds(self):
+        client, store = self._client()
+        with client:
+            base = "/api/devices/studio-one/history?metrics=sys.cpu_util"
+            assert client.get(base + "&from_ts=1700000000").status_code == 400
+            assert client.get(base + "&to_ts=1700000000").status_code == 400
+            r = client.get(base + "&from_ts=1700000000&to_ts=1700001000")
+            assert r.status_code == 200
+            assert client.get(base + "&from_ts=200&to_ts=100").status_code == 400
+            assert client.get(base + "&from_ts=100&to_ts=100").status_code == 400
+            assert client.get(base + "&from_ts=nan&to_ts=200").status_code == 400
+        store.close()
+
+    def test_history_7d_includes_recent_samples(self):
+        # The 7d/30d charts' from_ts sits far behind the full-res cutoff;
+        # their right edge must still reach the live samples.
+        cfg = Config(devices=[Device(name="Studio One", host="h")])
+        store = Store.in_memory(Retention(full_res_hours=1))
+        states = {d.id: DeviceState(d) for d in cfg.devices}
+        now = time.time()
+        store.insert("studio-one", now - 2 * 3600, "system", {"sys.cpu_util": 0.5})
+        store.insert("studio-one", now - 60, "system", {"sys.cpu_util": 0.9})
+        store.commit()
+        store.rollup_and_prune(now=now)
+        app = create_app(cfg, store, states, start_pollers=False)
+        with TestClient(app) as client:
+            r = client.get("/api/devices/studio-one/history?metrics=sys.cpu_util&range=7d")
+            assert r.status_code == 200
+            values = [v for _, v in r.json()["series"]["sys.cpu_util"]]
+            assert values[-1] == pytest.approx(0.9)
+            assert r.json()["bands"]["sys.cpu_util"]
+        store.close()
+
+    def test_app_shutdown_closes_store(self):
+        # Lifespan teardown must await the cancelled background tasks, then
+        # close the store — not close it while tasks may still write.
+        client, store = self._client()
+        with client:
+            assert client.get("/api/devices").status_code == 200
+        with pytest.raises(sqlite3.ProgrammingError):
+            store.commit()

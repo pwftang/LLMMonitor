@@ -27,28 +27,24 @@ has no auth, so it must not listen on LAN/Wi-Fi (especially on the MacBook):
 
 ```sh
 brew install macmon          # or: cargo install macmon
-tailscale ip -4              # note the 100.x.y.z address
-which tailscale              # sanity: CLI must exist at a known path
 ```
 
-Each Mac has its own plist under `macos/` — its tailscale IP is baked in
-(stable on a tailnet) and it execs `/opt/homebrew/bin/macmon` directly, so
-there is no shell or `$PATH` to go wrong (launchd gives jobs a minimal PATH;
-a shell one-liner in a plist that calls `brew` or bare `tailscale` will fail):
-`macos/com.macmon.mac-studio-m2-ultra.plist` → `100.74.115.38`
-`macos/com.macmon.patricks-mac-studio.plist`   → `100.117.172.29`
-`macos/com.macmon.pats-macbook-pro.plist`      → `100.91.150.110`
-
-On an Intel Mac edit line 9 to `/usr/local/bin/macmon`. For new machines,
-`com.macmon.plist` at the repo root is a template that locates the tailscale
-CLI and tailnet IP itself at start — prefer a hardcoded-IP copy once known.
-
-Copy onto the Mac and load:
+Then run the bootstrap script from this repo on the Mac:
 
 ```sh
-# filename on the Mac must be com.macmon.plist
-mkdir -p ~/Library/LaunchAgents
-launchctl load ~/Library/LaunchAgents/com.macmon.plist
+./macos/install-macmon-agent.sh
+```
+
+The script writes `~/Library/LaunchAgents/com.macmon.plist` and bootstraps it
+with launchd. The plist execs `/bin/sh` so it can *wait for* the tailnet IP
+(up to 5 minutes, retried via `KeepAlive`): macmon previously raced Tailscale
+at boot and either crashed or bound to the wrong interface. This also means no
+per-machine plists and no hardcoded IPs — every Mac runs the identical file.
+`com.macmon.plist` at the repo root is the same plist for manual installs.
+
+Verify:
+
+```sh
 launchctl list | grep macmon          # column 1 = PID means running
 curl -s http://$(tailscale ip -4 | head -1):9090/json | head -c 200
 ```

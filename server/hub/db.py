@@ -119,12 +119,25 @@ class Store:
     def history_with_bands(
         self, device: str, metrics: Iterable[str], from_ts: float, to_ts: float
     ) -> tuple[dict[str, list[list[float]]], dict[str, dict[str, list[list[float]]]]]:
-        """Return (series, bands). Bands carry per-bucket min/max and are only
-        available when the range falls back to 5-minute rollups; {} otherwise."""
+        """Return (series, bands). The past-full-res half comes from rollups
+        (with per-bucket min/max bands), the recent half from raw samples, so
+        a long-range chart ends at the newest samples instead of going stale a
+        day before "now". The halves meet at the rollup horizon — the cutoff
+        rounded down to a bucket boundary — so there's no seam when rollups
+        are current. Bands only describe the rollup portion; {} within range."""
         full_res_cutoff = time.time() - self.retention.full_res_hours * 3600
-        if from_ts < full_res_cutoff:
+        if from_ts >= full_res_cutoff:
+            return self._history_samples(device, metrics, from_ts, to_ts), {}
+        horizon = (
+            int(full_res_cutoff // self.retention.rollup_seconds) * self.retention.rollup_seconds
+        )
+        if to_ts <= horizon:
             return self._history_rollups(device, metrics, from_ts, to_ts)
-        return self._history_samples(device, metrics, from_ts, to_ts), {}
+        series, bands = self._history_rollups(device, metrics, from_ts, horizon)
+        recent = self._history_samples(device, metrics, horizon, to_ts)
+        for metric, points in recent.items():
+            series.setdefault(metric, []).extend(points)
+        return series, bands
 
     def _history_rollups(self, device, metrics, from_ts, to_ts):
         series: dict[str, list[list[float]]] = {m: [] for m in metrics}

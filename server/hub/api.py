@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -51,10 +52,14 @@ def create_app(cfg: Config, store: Store, states: dict[str, DeviceState], *, sta
                 ))
         tasks.append(asyncio.create_task(_commit_loop(store)))
         tasks.append(asyncio.create_task(_rollup_loop(store)))
-        yield
-        for t in tasks:
-            t.cancel()
-        store.close()
+        try:
+            yield
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            store.commit()
+            store.close()
 
     app = FastAPI(title="LLMMonitor hub", lifespan=lifespan)
 
@@ -80,11 +85,17 @@ def create_app(cfg: Config, store: Store, states: dict[str, DeviceState], *, sta
         if dev_id not in states:
             raise HTTPException(404, f"unknown device: {dev_id}")
         now = time.time()
+        if (from_ts is None) != (to_ts is None):
+            raise HTTPException(400, "from_ts and to_ts must be given together")
         if from_ts is None or to_ts is None:
             span = RANGE_SECONDS.get(range)
             if span is None:
                 raise HTTPException(400, f"unknown range: {range} (use one of {sorted(RANGE_SECONDS)})")
             from_ts, to_ts = now - span, now
+        elif not (math.isfinite(from_ts) and math.isfinite(to_ts)):
+            raise HTTPException(400, "from_ts/to_ts must be finite numbers")
+        elif from_ts >= to_ts:
+            raise HTTPException(400, "from_ts must be before to_ts")
         metric_list = [m.strip() for m in metrics.split(",") if m.strip()]
         if not metric_list:
             raise HTTPException(400, "no metrics requested")

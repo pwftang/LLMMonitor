@@ -105,8 +105,9 @@ def load(path: str | os.PathLike | None = None) -> Config:
         Device(
             name=d["name"],
             host=d["host"],
-            omlx_port=d.get("omlx_port"),
-            macmon_port=d.get("macmon_port"),
+            # Omitted → default port; explicitly 0 (or null) → source disabled.
+            omlx_port=d.get("omlx_port", 8000),
+            macmon_port=d.get("macmon_port", 9090),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )

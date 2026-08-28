@@ -22,27 +22,27 @@ rollup_seconds = 300        # rollup bucket size
 #             name. Set it if you may rename a device later, so its history
 #             stays attached to the same id.
 # host      — Tailscale hostname or 100.x.y.z IP
-# omlx_port — omlx admin port (default 8080); omit omlx entirely for non-serving machines
-# macmon_port — macmon serve port (default 9090)
+# omlx_port — omlx admin port (default 8000); set 0 to disable omlx for a machine
+# macmon_port — macmon serve port (default 9090); set 0 to disable macmon
 # api_key   — omlx API key (omit if the server has no key configured)
 
 [[devices]]
 name = "Mac Studio M2 Ultra"
 host = "mac-studio-m2-ultra.tailc08855.ts.net"
-omlx_port = 8080
+omlx_port = 8000
 macmon_port = 9090
 api_key = "your-omlx-api-key-here"
 
 [[devices]]
 name = "Mac Studio M2 Max"
 host = "patricks-mac-studio.tailc08855.ts.net"
-omlx_port = 8080
+omlx_port = 8000
 macmon_port = 9090
 api_key = "your-omlx-api-key-here"
 
 [[devices]]
 name = "MacBook Pro"
 host = "pats-macbook-pro.tailc08855.ts.net"
-omlx_port = 8080
+omlx_port = 8000
 macmon_port = 9090
 api_key = "your-omlx-api-key-here"
