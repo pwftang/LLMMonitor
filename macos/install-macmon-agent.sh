@@ -1,3 +1,17 @@
+#!/bin/bash
+# Install/refresh the macmon LaunchAgent on a Mac.
+#
+# The agent waits up to 5 minutes for Tailscale to assign a 100.* address
+# before starting macmon (reboot-safe: macmon no longer races Tailscale),
+# and KeepAlive relaunches it if it ever exits. Re-running is safe and also
+# kills any stray manually-started macmon first.
+set -euo pipefail
+
+PLIST="$HOME/Library/LaunchAgents/com.macmon.plist"
+
+pkill -f "macmon serve" 2>/dev/null && echo "killed running macmon instance" || true
+
+cat > "$PLIST" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -15,3 +29,10 @@
   <key>StandardErrorPath</key><string>/tmp/macmon.log</string>
 </dict>
 </plist>
+EOF
+
+launchctl bootout "gui/$(id -u)/com.macmon" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+
+sleep 3
+tail -n 3 /tmp/macmon.log

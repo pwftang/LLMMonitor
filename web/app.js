@@ -25,6 +25,18 @@ const ago = (ts) => {
   return `${Math.round(s / 3600)}h ago`;
 };
 const val = (obj, key) => (obj && obj[key] != null ? obj[key] : null);
+// macmon can die while omlx keeps the device "online"; flag it so the
+// (frozen) sys.* numbers aren't mistaken for live data.
+function macmonWarn(el, d) {
+  const down = d.online && d.has_macmon && d.macmon_ok === false;
+  el.hidden = !down;
+  if (down) {
+    el.title = d.macmon_last_ok
+      ? `macmon last responded ${ago(d.macmon_last_ok)} — system & power stats are stale`
+      : "macmon has not responded since the hub started — system & power stats unavailable";
+  }
+  return down;
+}
 
 /* ---------- api ---------- */
 async function api(path) {
@@ -282,10 +294,14 @@ async function renderOverview() {
     card.innerHTML = `
       <div class="card-head">
         <span class="status-dot"></span>
-        <h2>${esc(d.name)} <span class="omlx-ver"></span></h2>
+        <div class="card-title">
+          <h2>${esc(d.name)} <span class="omlx-ver"></span></h2>
+          <div class="card-ips"></div>
+        </div>
         ${d.omlx_admin_url
           ? `<a class="icon-btn card-admin" href="${esc(d.omlx_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx admin dashboard" aria-label="open omlx admin dashboard">${icon("ext")}</a>`
           : ""}
+        <span class="macmon-warn" hidden>macmon unreachable</span>
         <span class="card-state"></span>
       </div>
       <div class="card-body">
@@ -303,7 +319,7 @@ async function renderOverview() {
             <div class="stat"><span class="label">total prefill tokens</span><span class="value i-val" data-i="ptok">—</span></div>
           </div>
         </div>
-        <div class="ov-sec">
+        <div class="ov-sec sec-sys">
           <div class="ov-sec-head">${icon("cpu")}<span class="kicker">system</span></div>
           <div class="mbar-line">
             <span class="kicker">ram used</span>
@@ -320,7 +336,7 @@ async function renderOverview() {
           <div class="hw-line"></div>
           <span class="ago"></span>
         </div>
-        <div class="ov-sec">
+        <div class="ov-sec sec-pwr">
           <div class="ov-sec-head">${icon("zap")}<span class="kicker">power</span></div>
           <div class="i-stats">
             <div class="stat"><span class="label">power draw</span><span class="value i-val" data-p="pwr">—</span></div>
@@ -339,6 +355,8 @@ async function renderOverview() {
     const dotEl = card.querySelector(".status-dot");
     const stateEl = card.querySelector(".card-state");
     const verEl = card.querySelector(".omlx-ver");
+    const ipEl = card.querySelector(".card-ips");
+    const macmonWarnEl = card.querySelector(".macmon-warn");
     const modelsEl = card.querySelector(".models-zone");
     const iEls = {};
     for (const el of card.querySelectorAll(".i-val[data-i]")) iEls[el.dataset.i] = el;
@@ -353,6 +371,7 @@ async function renderOverview() {
     const hwEl = card.querySelector(".hw-line");
     const agoEl = card.querySelector(".ago");
     let lastRows = "";
+    let lastIPs = "";
     const updateCard = (fresh) => {
       const s = fresh.system || {}, llm = fresh.llm || {};
       const pressure = fresh.pressure_level;
@@ -364,7 +383,16 @@ async function renderOverview() {
       dotEl.className = `status-dot ${state[0]}`;
       stateEl.textContent = state[1];
       stateEl.className = `card-state st-${state[0] || "idle"}`;
+      card.classList.toggle("sys-stale", macmonWarn(macmonWarnEl, fresh));
       verEl.textContent = fresh.omlx_version ? `omlx ${fresh.omlx_version}` : "";
+      const ipBits = [];
+      if (fresh.tailscale_ip) ipBits.push(`<span class="cip"><b>ts</b>&hairsp;${esc(fresh.tailscale_ip)}</span>`);
+      if (fresh.local_ip) ipBits.push(`<span class="cip"><b>lan</b>&hairsp;${esc(fresh.local_ip)}</span>`);
+      const ipHTML = ipBits.join("");
+      if (ipHTML !== lastIPs) {
+        lastIPs = ipHTML;
+        ipEl.innerHTML = ipHTML;
+      }
 
       const rows = modelRowsHTML(liveModels(fresh));
       if (rows !== lastRows) {
@@ -499,6 +527,7 @@ async function renderDetail(id, initialRange = "1h") {
         <a class="back" href="#">&larr; all devices</a>
         <h2>${esc(d.name)}</h2>
         <span class="d-state"><span class="status-dot"></span><span class="d-state-text"></span></span>
+        <span class="macmon-warn" hidden>macmon unreachable</span>
         <div class="segments">${RANGES
           .map((r) => `<button data-r="${r}" class="${r === range ? "active" : ""}">${r}</button>`)
           .join("")}</div>
@@ -585,6 +614,8 @@ async function renderDetail(id, initialRange = "1h") {
         txt.textContent = state[1];
         txt.className = `d-state-text st-${state[0] || "idle"}`;
       }
+      const macmonWarnEl = view.querySelector(".macmon-warn");
+      if (macmonWarnEl) macmonWarn(macmonWarnEl, d);
 
       const bigCells = view.querySelectorAll("#big .big");
       if (bigCells.length) {

@@ -1,4 +1,6 @@
+import asyncio
 import time
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -347,6 +349,36 @@ class TestPoller:
         assert state.last_error == "unreachable"
         store.close()
 
+    async def test_macmon_failure_tracked_per_source(self):
+        # The 2026-08-25 incident: macmon died on both Studios while omlx kept
+        # serving, so devices showed "online" with silently frozen sys.* stats.
+        fail = {"macmon": False}
+
+        def handler(request):
+            if request.url.path == "/json":
+                if fail["macmon"]:
+                    raise httpx.ConnectError("connection refused")
+                return httpx.Response(200, json=MACMON_PAYLOAD)
+            return httpx.Response(200, json=OMLX_STATS)
+
+        dev = Device(name="T", host="h", omlx_port=8080, macmon_port=9090)
+        poller, state, store = self._poller(handler, dev)
+        assert state.macmon_ok is None  # not polled yet → no UI badge
+
+        fail["macmon"] = True
+        assert await poller._tick_fast() is True
+        assert state.online  # device stays "online" via omlx
+        assert state.macmon_ok is False
+        assert state.public()["macmon_ok"] is False
+        assert state.macmon_last_ok is None
+
+        fail["macmon"] = False
+        assert await poller._tick_fast() is True
+        assert state.macmon_ok is True
+        assert state.macmon_last_ok is not None
+        assert state.public()["macmon_ok"] is True
+        store.close()
+
     async def test_models_tick_unwraps_payload_for_frontend(self):
         def handler(request):
             return httpx.Response(
@@ -420,6 +452,29 @@ class TestApi:
             assert devs["serving"]["has_omlx"] is True
             assert devs["headless"]["omlx_admin_url"] is None
             assert devs["headless"]["has_omlx"] is False
+        store.close()
+
+    def test_devices_expose_ip_fields(self):
+        # The card header shows tailscale/local IPs; both stay None until the
+        # poller's DNS resolution runs, then reflect the resolved addresses.
+        cfg = Config(devices=[Device(name="Studio", host="studio.example.ts.net")])
+        store = Store.in_memory()
+        dev = cfg.devices[0]
+        state = DeviceState(dev)
+        app = create_app(cfg, store, {dev.id: state}, start_pollers=False)
+        with TestClient(app) as client:
+            served = client.get("/api/devices").json()[0]
+            assert served["tailscale_ip"] is None
+            assert served["local_ip"] is None
+        poller = DevicePoller(dev, cfg, store, state)
+        with patch("hub.poll._resolve_ipv4", new=AsyncMock(side_effect=lambda name: {
+            "studio.example.ts.net": "100.64.0.7",
+            "studio.local": "192.168.0.7",
+        }.get(name))):
+            asyncio.run(poller._resolve_ips())
+        assert state.tailscale_ip == "100.64.0.7"
+        assert state.local_ip == "192.168.0.7"
+        assert state.public()["tailscale_ip"] == "100.64.0.7"
         store.close()
 
     def test_static_assets_disable_caching(self):

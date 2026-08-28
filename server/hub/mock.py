@@ -59,6 +59,11 @@ class MockPoller:
 
     async def run(self) -> None:
         self.state.omlx_version = "0.6.2"
+        self.state.macmon_ok = True
+        # Nominal addresses so the card header shows both IP rows
+        octet = sum(map(ord, self.device.id)) % 200 + 10
+        self.state.tailscale_ip = f"100.64.0.{octet}"
+        self.state.local_ip = f"192.168.0.{octet}"
         while True:
             self.t += self.cfg.poll_interval
             if self.flaps and (self.t % 300.0) > 180.0:

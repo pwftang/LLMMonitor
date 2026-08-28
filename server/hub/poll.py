@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from typing import Any
 
@@ -19,6 +20,14 @@ from .config import Config, Device
 from .db import Store
 
 log = logging.getLogger("hub.poll")
+
+
+async def _resolve_ipv4(name: str) -> str | None:
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(name, None, family=socket.AF_INET)
+    except OSError:
+        return None
+    return infos[0][4][0] if infos else None
 
 
 def _slug(text: str) -> str:
@@ -144,6 +153,12 @@ class DeviceState:
         self.last_seen: float | None = None
         self.pressure_level: str | None = None
         self.omlx_version: str | None = None
+        self.tailscale_ip: str | None = None
+        self.local_ip: str | None = None
+        # Per-source health: None until the first macmon attempt, so partially
+        # failing sources (macmon down, omlx up) can be surfaced in the UI.
+        self.macmon_ok: bool | None = None
+        self.macmon_last_ok: float | None = None
         self.system: dict[str, float] = {}
         self.llm: dict[str, float] = {}
         self.raw: dict[str, Any] = {}
@@ -166,9 +181,13 @@ class DeviceState:
             "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
             "omlx_admin_url": f"{base}/admin" if base else None,
+            "tailscale_ip": self.tailscale_ip,
+            "local_ip": self.local_ip,
             "online": self.online,
             "last_error": self.last_error,
             "last_seen": self.last_seen,
+            "macmon_ok": self.macmon_ok,
+            "macmon_last_ok": self.macmon_last_ok,
             "pressure_level": self.pressure_level,
             "omlx_version": self.omlx_version,
             "system": self.system,
@@ -177,11 +196,17 @@ class DeviceState:
         }
 
 
+# seconds between device IP re-resolutions; local DNS is cheap and this
+# self-heals when a device's LAN address changes under DHCP
+_IP_TTL = 60.0
+
+
 class DevicePoller:
     def __init__(self, device: Device, cfg: Config, store: Store, state: DeviceState):
         self.device, self.cfg, self.store, self.state = device, cfg, store, state
         self._backoff_until = 0.0
         self._version_fetched_at = 0.0
+        self._ips_resolved_at = 0.0
         self._client: httpx.AsyncClient | None = None
 
     async def run(self) -> None:
@@ -241,7 +266,20 @@ class DevicePoller:
             log.debug("%s omlx version fetch failed: %s", self.device.id, e)
         self._version_fetched_at = time.monotonic()
 
+    async def _resolve_ips(self) -> None:
+        if time.monotonic() - self._ips_resolved_at < _IP_TTL:
+            return
+        # The TTL applies to failures too — a device that is off the tailnet
+        # fails DNS slowly, and we don't want that blocking every tick.
+        self._ips_resolved_at = time.monotonic()
+        self.state.tailscale_ip = await _resolve_ipv4(self.device.host)
+        # Best-effort mDNS: "box.tailnet.ts.net" → "box.local". Stays None on
+        # LANs without mDNS, and the UI simply omits the line.
+        short = self.device.host.split(".")[0]
+        self.state.local_ip = await _resolve_ipv4(f"{short}.local")
+
     async def _tick_fast(self) -> bool:
+        await self._resolve_ips()
         ok = False
         if self.device.macmon_url:
             ok |= await self._tick_macmon()
@@ -257,6 +295,7 @@ class DevicePoller:
 
     async def _tick_macmon(self) -> bool:
         assert self._client is not None and self.device.macmon_url is not None
+        was_ok = self.state.macmon_ok
         try:
             r = await self._client.get(self.device.macmon_url)
             r.raise_for_status()
@@ -264,8 +303,16 @@ class DevicePoller:
             if not isinstance(payload, dict):
                 raise ValueError("macmon /json returned non-object payload")
         except Exception as e:  # noqa: BLE001
-            log.debug("%s macmon failed: %s", self.device.id, e)
+            # Warn on transition only — logging every tick would spam the log
+            # for the whole duration of an outage.
+            if was_ok is not False:
+                log.warning("%s macmon unreachable: %s", self.device.id, e)
+            self.state.macmon_ok = False
             return False
+        if was_ok is False:
+            log.info("%s macmon recovered", self.device.id)
+        self.state.macmon_ok = True
+        self.state.macmon_last_ok = time.time()
         series = extract_system(payload)
         self.state.system = series
         self.state.raw["macmon"] = payload
