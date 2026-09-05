@@ -25,10 +25,6 @@ rollup_seconds = 300        # rollup bucket size
 # omlx_port — omlx admin port (default 8000); set 0 to disable omlx for a machine
 # macmon_port — macmon serve port (default 9090); set 0 to disable macmon
 # comfyui_port — ComfyUI port (opt-in; omit or set 0 to disable)
-# llamacpp_port — llama-server (llama.cpp) port (opt-in; omit or set 0 to disable).
-#             llama-server needs --metrics for the Prometheus /metrics endpoint
-#             and must listen on the tailnet interface (--host 0.0.0.0, or its
-#             tailnet IP) to be polled from the hub box.
 # api_key   — omlx API key (omit if the server has no key configured)
 
 [[devices]]
@@ -44,7 +40,6 @@ name = "Mac Studio M2 Max"
 host = "patricks-mac-studio.tailc08855.ts.net"
 omlx_port = 8000
 macmon_port = 9090
-llamacpp_port = 8080         # llama-server --port, needs --metrics enabled
 api_key = "your-omlx-api-key-here"
 
 [[devices]]

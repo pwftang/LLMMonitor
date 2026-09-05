@@ -14,12 +14,9 @@ from hub.poll import (
     DevicePoller,
     DeviceState,
     extract_comfyui,
-    extract_llamacpp,
     extract_model_series,
     extract_omlx_stats,
     extract_system,
-    llamacpp_model_name,
-    parse_prometheus,
 )
 
 # From the macmon README example (same shape as `macmon serve` /json).
@@ -86,56 +83,6 @@ COMFY_SYS = {
             "torch_vram_free": 7 * 1024**3,
         }
     ],
-}
-
-# Real llama-server /metrics (llama.cpp b6788, --metrics), lightly trimmed:
-# HELP/TYPE comments kept for the parser, all series are unlabelled.
-# Counters are cumulative since process start; rates need two samples.
-LLAMACPP_METRICS_T1 = """\
-# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed
-# TYPE llamacpp:prompt_tokens_total counter
-llamacpp:prompt_tokens_total 101225
-# HELP llamacpp:prompt_seconds_total Prompt process time
-# TYPE llamacpp:prompt_seconds_total counter
-llamacpp:prompt_seconds_total 390.512
-# HELP llamacpp:tokens_predicted_total Number of generation tokens processed
-# TYPE llamacpp:tokens_predicted_total counter
-llamacpp:tokens_predicted_total 70031
-# HELP llamacpp:tokens_predicted_seconds_total Predict process time
-# TYPE llamacpp:tokens_predicted_seconds_total counter
-llamacpp:tokens_predicted_seconds_total 4254.3
-# HELP llamacpp:kv_cache_tokens KV-cache tokens
-# TYPE llamacpp:kv_cache_tokens gauge
-llamacpp:kv_cache_tokens 53248
-# HELP llamacpp:kv_cache_usage_ratio KV-cache usage. 1 means 100 percent usage
-# TYPE llamacpp:kv_cache_usage_ratio gauge
-llamacpp:kv_cache_usage_ratio 0.40625
-# HELP llamacpp:requests_processing Number of requests processing
-# TYPE llamacpp:requests_processing gauge
-llamacpp:requests_processing 1
-# HELP llamacpp:requests_deferred Number of requests deferred
-# TYPE llamacpp:requests_deferred gauge
-llamacpp:requests_deferred 0
-"""
-
-# 10s later: 400 prompt tokens in 1.6s of work, 120 gen tokens in 3.0s.
-LLAMACPP_METRICS_T2 = LLAMACPP_METRICS_T1.replace("101225", "101625") \
-    .replace("390.512", "392.112").replace("70031", "70151") \
-    .replace("4254.3", "4257.3").replace("53248", "53768") \
-    .replace("0.40625", "0.410156") \
-    .replace("requests_processing 1", "requests_processing 2")
-
-# Truncated real /props: model identity lives here.
-LLAMACPP_PROPS = {
-    "assistant_name": "Hermes Hermes",
-    "default_generation_settings": {
-        "model": "/Users/pat/models/Qwen3-32B-Q4_K_M.gguf",
-        "n_ctx": 131072,
-        "speculative": {"n_max": 16, "n_min": 0, "p_min": 0.75},
-    },
-    "model_path": "/Users/pat/models/Qwen3-32B-Q4_K_M.gguf",
-    "model_alias": "qwen3-32b-hermes",
-    "chat_template": "{%- for m in messages %}...{% endfor %}",
 }
 
 
@@ -248,104 +195,6 @@ class TestExtractModelSeries:
     def test_garbage_is_ignored(self):
         assert extract_model_series({"models": "nope"}) == {}
         assert extract_model_series([{"no_id": True}, 42, None]) == {}
-
-
-class TestParsePrometheus:
-    def test_real_llamacpp_metrics(self):
-        c = parse_prometheus(LLAMACPP_METRICS_T1)
-        assert c["llamacpp:prompt_tokens_total"] == 101225.0
-        assert c["llamacpp:tokens_predicted_total"] == 70031.0
-        assert c["llamacpp:kv_cache_usage_ratio"] == pytest.approx(0.40625)
-        assert c["llamacpp:requests_processing"] == 1.0
-        assert c["llamacpp:requests_deferred"] == 0.0
-
-    def test_labels_and_comments(self):
-        # Labelled series (llama.cpp doesn't emit any for these metrics, but
-        # Prometheus exporters generally do) collapse to the last sample.
-        c = parse_prometheus(
-            '# HELP x metric\n'
-            '# TYPE x gauge\n'
-            'x{slot="0"} 1\n'
-            'x{slot="1"} 2\n'
-            'not_a_metric_line\n'
-        )
-        assert c == {"x": 2.0}
-
-    def test_nan_and_inf_dropped(self):
-        c = parse_prometheus("a NaN\nb +Inf\nc -Inf\nd 1.5e3\n")
-        assert c == {"d": 1500.0}
-
-    def test_empty(self):
-        assert parse_prometheus("") == {}
-        assert parse_prometheus("# only comments here\n") == {}
-
-
-class TestExtractLlamacpp:
-    def test_first_poll_has_no_rates(self):
-        # Counters are cumulative since process start; a rate needs two
-        # samples, so the first poll yields counters/gauges only.
-        m = extract_llamacpp(parse_prometheus(LLAMACPP_METRICS_T1), None, 1000.0)
-        assert m["llamacpp.prompt_tokens"] == 101225.0
-        assert m["llamacpp.gen_tokens"] == 70031.0
-        assert m["llamacpp.active_reqs"] == 1.0
-        assert m["llamacpp.waiting_reqs"] == 0.0
-        assert m["llamacpp.kv_used_tokens"] == 53248.0
-        assert m["llamacpp.kv_used_pct"] == pytest.approx(0.40625)
-        assert "llamacpp.prefill_tps" not in m
-        assert "llamacpp.gen_tps" not in m
-
-    def test_rates_from_counter_deltas(self):
-        prev = (1000.0, parse_prometheus(LLAMACPP_METRICS_T1))
-        m = extract_llamacpp(parse_prometheus(LLAMACPP_METRICS_T2), prev, 1010.0)
-        # Δ400 prompt tokens / Δ1.6 prompt-seconds (work time, not wall clock)
-        assert m["llamacpp.prefill_tps"] == pytest.approx(250.0)
-        # Δ120 gen tokens / Δ3.0 gen-seconds
-        assert m["llamacpp.gen_tps"] == pytest.approx(40.0)
-        # gauges track the latest sample
-        assert m["llamacpp.active_reqs"] == 2.0
-        assert m["llamacpp.kv_used_tokens"] == 53768.0
-
-    def test_wall_clock_fallback_without_seconds_counters(self):
-        # Older llama.cpp builds lack the *_seconds_total counters; rates
-        # then fall back to wall-clock deltas between polls.
-        text = "llamacpp:prompt_tokens_total 100\n" \
-               "llamacpp:tokens_predicted_total 40\n"
-        text2 = "llamacpp:prompt_tokens_total 250\n" \
-                "llamacpp:tokens_predicted_total 80\n"
-        prev = (100.0, parse_prometheus(text))
-        m = extract_llamacpp(parse_prometheus(text2), prev, 105.0)
-        assert m["llamacpp.prefill_tps"] == pytest.approx(30.0)
-        assert m["llamacpp.gen_tps"] == pytest.approx(8.0)
-
-    def test_counter_reset_yields_no_rate(self):
-        # llama-server restarted between polls: cumulative counters drop, and
-        # a rate computed across the reset would be nonsense.
-        prev = (1000.0, parse_prometheus(LLAMACPP_METRICS_T2))
-        reset = parse_prometheus(LLAMACPP_METRICS_T1)
-        # keep counters below prev's so the reset tripwire engages
-        reset["llamacpp:prompt_tokens_total"] = 5.0
-        reset["llamacpp:tokens_predicted_total"] = 7.0
-        m = extract_llamacpp(reset, prev, 1010.0)
-        assert "llamacpp.prefill_tps" not in m
-        assert "llamacpp.gen_tps" not in m
-        assert m["llamacpp.prompt_tokens"] == 5.0
-
-    def test_missing_metrics_are_skipped(self):
-        m = extract_llamacpp({}, None, 0.0)
-        assert m == {}
-
-
-class TestLlamacppModelName:
-    def test_alias_preferred(self):
-        assert llamacpp_model_name(LLAMACPP_PROPS) == "qwen3-32b-hermes"
-
-    def test_default_generation_settings_fallback(self):
-        props = {"default_generation_settings": {"model": "/models/phi-4.gguf"}}
-        assert llamacpp_model_name(props) == "/models/phi-4.gguf"
-
-    def test_missing(self):
-        assert llamacpp_model_name({}) is None
-        assert llamacpp_model_name({"model_alias": "", "default_generation_settings": {}}) is None
 
 
 class TestStore:
@@ -538,20 +387,6 @@ macmon_port = 9091
         assert comfy.comfyui_base == "http://b:8188"
         assert off.comfyui_port == 0 and off.comfyui_base is None
 
-    def test_llamacpp_opt_in(self, tmp_path):
-        # Same opt-in rule as ComfyUI: llama-server has no default port, so
-        # omitted (or 0) disables it and an explicit port enables it.
-        (tmp_path / "hub.toml").write_text(
-            '[[devices]]\nname = "No Llama"\nhost = "a"\n'
-            '[[devices]]\nname = "Llama"\nhost = "b"\nllamacpp_port = 8080\n'
-            '[[devices]]\nname = "Off"\nhost = "c"\nllamacpp_port = 0\n'
-        )
-        cfg = load(tmp_path / "hub.toml")
-        no_llama, llama, off = cfg.devices
-        assert no_llama.llamacpp_port is None and no_llama.llamacpp_base is None
-        assert llama.llamacpp_base == "http://b:8080"
-        assert off.llamacpp_port == 0 and off.llamacpp_base is None
-
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
             '[[devices]]\nname = "A B"\nhost = "x"\n[[devices]]\nname = "a-b"\nhost = "y"\n'
@@ -729,81 +564,6 @@ class TestPoller:
         assert "comfyui" in state.raw
         store.close()
 
-    def _llamacpp_poller(self):
-        metrics = {"text": LLAMACPP_METRICS_T1}
-
-        def handler(request):
-            if request.url.path == "/metrics":
-                return httpx.Response(200, text=metrics["text"])
-            return httpx.Response(200, json=LLAMACPP_PROPS)
-
-        dev = Device(
-            name="T", host="h", omlx_port=None, macmon_port=None, llamacpp_port=8080
-        )
-        poller, state, store = self._poller(handler, dev)
-        return poller, state, store, metrics
-
-    async def test_llamacpp_success(self):
-        poller, state, store, metrics = self._llamacpp_poller()
-        assert state.llamacpp_ok is None
-
-        assert await poller._tick_fast() is True
-        assert state.llamacpp_ok is True
-        assert state.raw["llamacpp"]["model"] == "qwen3-32b-hermes"
-        assert state.raw["llamacpp"]["prompt_tokens"] == 101225.0
-        assert state.raw["llamacpp"]["kv_used_pct"] == pytest.approx(0.40625)
-        # First poll has no rate baseline.
-        assert state.raw["llamacpp"]["gen_tps"] is None
-        assert state.raw["llamacpp"]["prefill_tps"] is None
-
-        metrics["text"] = LLAMACPP_METRICS_T2
-        assert await poller._tick_fast() is True
-        assert state.raw["llamacpp"]["prefill_tps"] == pytest.approx(250.0)
-        assert state.raw["llamacpp"]["gen_tps"] == pytest.approx(40.0)
-        assert state.raw["llamacpp"]["active_reqs"] == 2.0
-
-        store.commit()
-        h = store.history(
-            "t", ["llamacpp.gen_tps", "llamacpp.kv_used_pct"], time.time() - 10, time.time() + 1
-        )
-        assert h["llamacpp.gen_tps"][-1][1] == pytest.approx(40.0)
-        assert h["llamacpp.kv_used_pct"][-1][1] == pytest.approx(0.410156)
-        store.close()
-
-    async def test_llamacpp_failure_clears_stale_raw(self):
-        ok = {"llama": True}
-        metrics = {"text": LLAMACPP_METRICS_T1}
-
-        def handler(request):
-            if not ok["llama"]:
-                raise httpx.ConnectError("connection refused")
-            if request.url.path == "/metrics":
-                return httpx.Response(200, text=metrics["text"])
-            return httpx.Response(200, json=LLAMACPP_PROPS)
-
-        dev = Device(
-            name="T", host="h", omlx_port=None, macmon_port=None, llamacpp_port=8080
-        )
-        poller, state, store = self._poller(handler, dev)
-        assert await poller._tick_fast() is True
-        metrics["text"] = LLAMACPP_METRICS_T2
-        assert await poller._tick_fast() is True
-        assert state.raw["llamacpp"]["gen_tps"] == pytest.approx(40.0)
-
-        ok["llama"] = False
-        assert await poller._tick_fast() is False
-        assert state.llamacpp_ok is False
-        assert "llamacpp" not in state.raw
-
-        ok["llama"] = True
-        assert await poller._tick_fast() is True
-        assert state.llamacpp_ok is True
-        assert "llamacpp" in state.raw
-        # The rate baseline was reset with the failure (a restarted server
-        # would have reset counters), so tps is absent again for one poll.
-        assert state.raw["llamacpp"]["gen_tps"] is None
-        store.close()
-
 
 class TestApi:
     def _client(self):
@@ -868,26 +628,6 @@ class TestApi:
             assert devs["comfy"]["comfy_ok"] is True
             assert devs["plain"]["has_comfyui"] is False
             assert devs["plain"]["comfy_ok"] is None
-        store.close()
-
-    def test_devices_expose_llamacpp_flags(self):
-        cfg = Config(devices=[
-            Device(name="Hermes", host="h", llamacpp_port=8080),
-            Device(name="Plain", host="p"),
-        ])
-        store = Store.in_memory()
-        states = {}
-        for d in cfg.devices:
-            states[d.id] = DeviceState(d)
-            states[d.id].mark_ok()
-        states["hermes"].llamacpp_ok = True
-        app = create_app(cfg, store, states, start_pollers=False)
-        with TestClient(app) as client:
-            devs = {d["id"]: d for d in client.get("/api/devices").json()}
-            assert devs["hermes"]["has_llamacpp"] is True
-            assert devs["hermes"]["llamacpp_ok"] is True
-            assert devs["plain"]["has_llamacpp"] is False
-            assert devs["plain"]["llamacpp_ok"] is None
         store.close()
 
     def test_devices_expose_ip_fields(self):

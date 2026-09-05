@@ -54,12 +54,6 @@ class MockPoller:
         self.ram_gb = 128.0 if "studio" in device.id else 32.0
         self.models = rng.sample(MODELS, k=rng.randint(1, 2))
         self.comfy_mem = _Walk(self.ram_gb * 0.2, self.ram_gb * 0.55, self.ram_gb * 0.35, 3.0)
-        # llama-server on a Mac: slower tg, modest prefill, finite 128k KV.
-        self.llamacpp_gen_tps = _Walk(0.0, 28.0, 9.0, 5.0)
-        self.llamacpp_prefill_tps = _Walk(0.0, 240.0, 40.0, 30.0)
-        self.llamacpp_kv_pct = _Walk(0.02, 0.95, 0.30, 0.08)
-        self.llamacpp_prompt_tokens = rng.uniform(50_000, 400_000)
-        self.llamacpp_gen_tokens = rng.uniform(20_000, 200_000)
         # The "macbook" mock cycles offline to exercise the offline UI.
         self.flaps = "mac" in device.id and "studio" not in device.id
         self.t = 0.0
@@ -123,17 +117,6 @@ class MockPoller:
                     "mem_gb": comfy["comfyui.model_mem_gb"],
                 }
                 self.store.insert(self.device.id, now, "comfyui", comfy)
-            if self.device.llamacpp_port:
-                llamacpp = self._llamacpp(busy)
-                self.state.llamacpp_ok = True
-                self.state.raw["llamacpp"] = {
-                    "model": "Qwen3-32B-Q4_K_M.gguf",
-                    "prompt_tokens": llamacpp["llamacpp.prompt_tokens"],
-                    "gen_tokens": llamacpp["llamacpp.gen_tokens"],
-                    "active_reqs": llamacpp["llamacpp.active_reqs"],
-                    "waiting_reqs": llamacpp["llamacpp.waiting_reqs"],
-                }
-                self.store.insert(self.device.id, now, "llamacpp", llamacpp)
             await asyncio.sleep(self.cfg.poll_interval)
 
     def _models(self, working: bool, busy: float, llm: dict) -> tuple[list[dict], list[dict]]:
@@ -267,24 +250,4 @@ class MockPoller:
             "comfyui.queue_running": running,
             "comfyui.queue_pending": float(pending),
             "comfyui.model_mem_gb": self.comfy_mem.next(),
-        }
-
-    def _llamacpp(self, busy: float) -> dict[str, float]:
-        active = max(0, round(busy * 3 + random.uniform(-1, 1)))
-        gen = self.llamacpp_gen_tps.next(18 if active else 0.0)
-        prefill = self.llamacpp_prefill_tps.next(150 if active else 0.0)
-        self.llamacpp_prompt_tokens += prefill * self.cfg.poll_interval
-        self.llamacpp_gen_tokens += gen * self.cfg.poll_interval
-        kv_pct = self.llamacpp_kv_pct.next(busy * 0.5 + 0.15)
-        return {
-            # direct mirrors of what extract_llamacpp derives from /metrics
-            "llamacpp.prompt_tokens": self.llamacpp_prompt_tokens,
-            "llamacpp.gen_tokens": self.llamacpp_gen_tokens,
-            "llamacpp.prefill_tps": prefill if active else 0.0,
-            "llamacpp.gen_tps": gen if active else 0.0,
-            "llamacpp.active_reqs": float(active),
-            "llamacpp.waiting_reqs": float(max(0, active - 2)),
-            # 128k-token context window
-            "llamacpp.kv_used_tokens": kv_pct * 131_072,
-            "llamacpp.kv_used_pct": kv_pct,
         }

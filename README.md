@@ -14,12 +14,9 @@ fan and power metrics, with history (24 h full-resolution, 30 d rolled up).
 │  FastAPI +   │   GET /admin/api/stats, /models        │      macmon :9090    │
 │  SQLite + JS │   GET http://<mac>:9090/json           │      ComfyUI :8188 * │
 └──────────────┘   GET http://<mac>:8188/queue, /system_stats (opt-in per device)
-                   GET http://<mac>:8080/metrics, /props (opt-in per device)
-                                                           └ llama-server :8080 *
 ```
 
-\* ComfyUI and llama-server polling are opt-in per device (`comfyui_port` /
-`llamacpp_port` in `hub.toml`).
+\* ComfyUI polling is opt-in per device (`comfyui_port` in `hub.toml`).
 
 The Macs run **nothing new except `macmon serve`** (Rust, no sudo, negligible
 footprint). The hub is a single Python process with one SQLite file, so moving
@@ -74,31 +71,10 @@ bind the tailnet IP — never `0.0.0.0`, especially on the MacBook.) Then add
 `comfyui_port = 8188` to that device's block in `hub.toml`. Nothing new runs on
 the Mac — the hub just polls the REST API ComfyUI already serves.
 
-### llama-server / llama.cpp (optional, per device)
-
-If a Mac also runs llama.cpp's llama-server (e.g. Hermes), the hub can show
-its generation/prefill throughput, request counts, KV cache usage and model
-name alongside everything else. llama-server must be started with `--metrics`
-(the Prometheus `/metrics` endpoint is off by default) and bound to the
-tailnet IP:
-
-```sh
-llama-server -m model.gguf --port 8080 --metrics \
-  --host $(tailscale ip -4 | head -1)
-```
-
-(`/metrics` and `/props` are unauthenticated, so again: tailnet IP only.) Then
-add `llamacpp_port = 8080` to that device's block in `hub.toml`. Sampling two
-polls apart is how the hub derives t/s from llama-server's cumulative token
-counters, so throughput appears from the second poll after start/restart.
-
-A device can run omlx and llama-server side by side; they report under
-separate `llm.*` / `llamacpp.*` metric namespaces and separate card sections.
-
-> **Trust boundary:** the omlx admin port is key-protected by you; macmon,
-> ComfyUI, llama-server and this hub are unauthenticated read-only endpoints.
-> All of them rely on the tailnet as the boundary — lock a Tailscale ACL to
-> your own devices if you want belt and braces.
+> **Trust boundary:** the omlx admin port is key-protected by you; macmon and
+> this hub are unauthenticated read-only endpoints. All three rely on the
+> tailnet as the boundary — lock a Tailscale ACL to your own devices if you
+> want belt and braces.
 
 ## Run the hub
 
