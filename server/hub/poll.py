@@ -1,9 +1,10 @@
-"""Poll one device: macmon /json + omlx admin API → metric namespace + latest state.
+"""Poll one device: macmon /json + omlx admin API + ComfyUI → metrics + latest state.
 
 Metric namespaces written to the store:
   sys.*   — macmon system metrics (kind="system")
   llm.*   — omlx /admin/api/stats (kind="llm")
   llm.model.<slug>.* — per-model series from /admin/api/models (kind="models")
+  comfyui.* — ComfyUI /queue + /system_stats (kind="comfyui"; opt-in per device)
 """
 
 from __future__ import annotations
@@ -143,6 +144,28 @@ def extract_model_series(models: list | dict) -> dict[str, float]:
     return out
 
 
+def extract_comfyui(queue: dict, stats: dict) -> dict[str, float]:
+    """ComfyUI /queue + /system_stats payloads → comfyui.* series.
+
+    Queue counts come from /queue; model memory is ComfyUI's torch allocator
+    delta on its compute device (on Mac, ComfyUI vram is unified RAM).
+    """
+    out: dict[str, float] = {}
+
+    def _count(key: str, v: Any) -> None:
+        out[key] = float(len(v)) if isinstance(v, list) else 0.0
+
+    _count("comfyui.queue_running", queue.get("queue_running"))
+    _count("comfyui.queue_pending", queue.get("queue_pending"))
+    devices = (stats or {}).get("devices")
+    if isinstance(devices, list) and devices and isinstance(devices[0], dict):
+        total = devices[0].get("torch_vram_total")
+        free = devices[0].get("torch_vram_free")
+        if isinstance(total, (int, float)) and isinstance(free, (int, float)):
+            out["comfyui.model_mem_gb"] = max(0.0, _gb(total - free))
+    return out
+
+
 class DeviceState:
     """Latest known state for one device; served by the REST API."""
 
@@ -159,6 +182,7 @@ class DeviceState:
         # failing sources (macmon down, omlx up) can be surfaced in the UI.
         self.macmon_ok: bool | None = None
         self.macmon_last_ok: float | None = None
+        self.comfy_ok: bool | None = None
         self.system: dict[str, float] = {}
         self.llm: dict[str, float] = {}
         self.raw: dict[str, Any] = {}
@@ -180,6 +204,8 @@ class DeviceState:
             "host": self.device.host,
             "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
+            "has_comfyui": self.device.comfyui_base is not None,
+            "comfy_ok": self.comfy_ok,
             "omlx_admin_url": f"{base}/admin" if base else None,
             "tailscale_ip": self.tailscale_ip,
             "local_ip": self.local_ip,
@@ -285,12 +311,15 @@ class DevicePoller:
             ok |= await self._tick_macmon()
         if self.device.omlx_base:
             ok |= await self._tick_omlx_stats()
+        if self.device.comfyui_base:
+            ok |= await self._tick_comfyui()
         if ok:
             self.state.mark_ok()
         else:
             self.state.mark_offline("unreachable")
-            log.warning("%s unreachable (macmon=%s omlx=%s)",
-                        self.device.id, self.device.macmon_url, self.device.omlx_base)
+            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s)",
+                        self.device.id, self.device.macmon_url, self.device.omlx_base,
+                        self.device.comfyui_base)
         return ok
 
     async def _tick_macmon(self) -> bool:
@@ -317,6 +346,40 @@ class DevicePoller:
         self.state.system = series
         self.state.raw["macmon"] = payload
         self.store.insert(self.device.id, time.time(), "system", series)
+        return True
+
+    async def _tick_comfyui(self) -> bool:
+        assert self._client is not None and self.device.comfyui_base is not None
+        was_ok = self.state.comfy_ok
+        try:
+            queue_r, stats_r = await asyncio.gather(
+                self._client.get(self.device.comfyui_base + "/queue"),
+                self._client.get(self.device.comfyui_base + "/system_stats"),
+            )
+            queue_r.raise_for_status()
+            stats_r.raise_for_status()
+            queue, stats = queue_r.json(), stats_r.json()
+            if not isinstance(queue, dict) or not isinstance(stats, dict):
+                raise ValueError("comfyui returned non-object payload")
+        except Exception as e:  # noqa: BLE001
+            if was_ok is not False:
+                log.warning("%s comfyui unreachable: %s", self.device.id, e)
+            self.state.comfy_ok = False
+            self.state.raw.pop("comfyui", None)
+            return False
+        if was_ok is False:
+            log.info("%s comfyui recovered", self.device.id)
+        self.state.comfy_ok = True
+        series = extract_comfyui(queue, stats)
+        devices = stats.get("devices") or [{}]
+        self.state.raw["comfyui"] = {
+            "version": (stats.get("system") or {}).get("comfyui_version"),
+            "device_type": devices[0].get("type") if isinstance(devices[0], dict) else None,
+            "queue_running": series["comfyui.queue_running"],
+            "queue_pending": series["comfyui.queue_pending"],
+            "mem_gb": series.get("comfyui.model_mem_gb"),
+        }
+        self.store.insert(self.device.id, time.time(), "comfyui", series)
         return True
 
     async def _tick_omlx_stats(self) -> bool:

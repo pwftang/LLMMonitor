@@ -53,6 +53,7 @@ class MockPoller:
         self.prompt_tokens = rng.uniform(200_000, 800_000)
         self.ram_gb = 128.0 if "studio" in device.id else 32.0
         self.models = rng.sample(MODELS, k=rng.randint(1, 2))
+        self.comfy_mem = _Walk(self.ram_gb * 0.2, self.ram_gb * 0.55, self.ram_gb * 0.35, 3.0)
         # The "macbook" mock cycles offline to exercise the offline UI.
         self.flaps = "mac" in device.id and "studio" not in device.id
         self.t = 0.0
@@ -105,6 +106,17 @@ class MockPoller:
                 slug = m["id"].lower().replace("/", "-").replace(".", "-").replace("_", "-")
                 model_series[f"llm.model.{slug}.mem_gb"] = m["actual_size"] / (1024**3)
             self.store.insert(self.device.id, now, "models", model_series)
+            if self.device.comfyui_port:
+                comfy = self._comfy(busy)
+                self.state.comfy_ok = True
+                self.state.raw["comfyui"] = {
+                    "version": "0.3.75",
+                    "device_type": "mps",
+                    "queue_running": comfy["comfyui.queue_running"],
+                    "queue_pending": comfy["comfyui.queue_pending"],
+                    "mem_gb": comfy["comfyui.model_mem_gb"],
+                }
+                self.store.insert(self.device.id, now, "comfyui", comfy)
             await asyncio.sleep(self.cfg.poll_interval)
 
     def _models(self, working: bool, busy: float, llm: dict) -> tuple[list[dict], list[dict]]:
@@ -228,4 +240,14 @@ class MockPoller:
             "llm.model_mem_gb": model_mem,
             "llm.active_reqs": float(active),
             "llm.waiting_reqs": float(max(0, active - 4)),
+        }
+
+    def _comfy(self, busy: float) -> dict[str, float]:
+        # Renders churn in bursts: jobs queue up when busy, drain when idle.
+        running = 1.0 if busy > 0.45 else 0.0
+        pending = max(0, round(busy * 6 + random.uniform(-1.5, 1.5)))
+        return {
+            "comfyui.queue_running": running,
+            "comfyui.queue_pending": float(pending),
+            "comfyui.model_mem_gb": self.comfy_mem.next(),
         }

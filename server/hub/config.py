@@ -17,6 +17,8 @@ class Device:
     host: str
     omlx_port: int | None = 8000
     macmon_port: int | None = 9090
+    # ComfyUI is opt-in: most machines don't run it, so no port → no polling.
+    comfyui_port: int | None = None
     api_key: str | None = None
     # Optional stable id; defaults to a slug of `name`. Set explicitly so a
     # display-name change doesn't orphan this device's stored history.
@@ -37,6 +39,12 @@ class Device:
         if not self.omlx_port:
             return None
         return f"http://{self.host}:{self.omlx_port}"
+
+    @property
+    def comfyui_base(self) -> str | None:
+        if not self.comfyui_port:
+            return None
+        return f"http://{self.host}:{self.comfyui_port}"
 
 
 @dataclass
@@ -108,6 +116,8 @@ def load(path: str | os.PathLike | None = None) -> Config:
             # Omitted → default port; explicitly 0 (or null) → source disabled.
             omlx_port=d.get("omlx_port", 8000),
             macmon_port=d.get("macmon_port", 9090),
+            # ComfyUI is different: omitted (or 0) → disabled; it's opt-in.
+            comfyui_port=d.get("comfyui_port"),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )
@@ -134,7 +144,7 @@ def _mock_devices() -> list[Device]:
     # omlx_port is nominal — MockPoller never makes HTTP calls; it exists so
     # the payload mirrors a real device (has_omlx, omlx_admin_url).
     return [
-        Device(name="Mock Studio A", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
+        Device(name="Mock Studio A", host="127.0.0.1", omlx_port=8080, macmon_port=9090, comfyui_port=8188),
         Device(name="Mock Studio B", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
         Device(name="Mock MacBook", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
     ]

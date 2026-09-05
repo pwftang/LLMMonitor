@@ -13,6 +13,7 @@ from hub.db import Store
 from hub.poll import (
     DevicePoller,
     DeviceState,
+    extract_comfyui,
     extract_model_series,
     extract_omlx_stats,
     extract_system,
@@ -64,6 +65,26 @@ OMLX_STATS = {
     "total_waiting_requests": 0,
 }
 
+# Real ComfyUI /queue + /system_stats (port 8188), trimmed to the fields used.
+COMFY_QUEUE = {
+    "queue_running": [[1, "p1", {}, {}, [9]]],
+    "queue_pending": [[2, "p2", {}, {}, [9]], [3, "p3", {}, {}, [9]]],
+}
+COMFY_SYS = {
+    "system": {"comfyui_version": "0.3.59"},
+    "devices": [
+        {
+            "name": "mps",
+            "type": "mps",
+            "index": 0,
+            "vram_total": 2**33,
+            "vram_free": 2**32,
+            "torch_vram_total": 2**33,
+            "torch_vram_free": 7 * 1024**3,
+        }
+    ],
+}
+
 
 class TestExtractSystem:
     def test_full_payload(self):
@@ -106,6 +127,25 @@ class TestExtractOmlxStats:
 
     def test_partial_payload(self):
         assert extract_omlx_stats({"avg_generation_tps": 3.2}) == {"llm.gen_tps": 3.2}
+
+
+class TestExtractComfyui:
+    def test_full_payload(self):
+        m = extract_comfyui(COMFY_QUEUE, COMFY_SYS)
+        assert m["comfyui.queue_running"] == 1.0
+        assert m["comfyui.queue_pending"] == 2.0
+        assert m["comfyui.model_mem_gb"] == pytest.approx(1.0)
+
+    def test_missing_devices(self):
+        # CPU-only or pre-device-stats builds: still counts the queue.
+        m = extract_comfyui(COMFY_QUEUE, {"system": {"comfyui_version": "0.3.59"}})
+        assert m["comfyui.queue_running"] == 1.0
+        assert m["comfyui.queue_pending"] == 2.0
+        assert "comfyui.model_mem_gb" not in m
+
+    def test_empty_payload(self):
+        m = extract_comfyui({}, {})
+        assert m == {"comfyui.queue_running": 0.0, "comfyui.queue_pending": 0.0}
 
 
 class TestExtractModelSeries:
@@ -333,6 +373,20 @@ macmon_port = 9091
         assert dev.macmon_port == 9090
         assert dev.macmon_url == "http://x:9090/json"
 
+    def test_comfyui_opt_in(self, tmp_path):
+        # Unlike omlx/macmon, ComfyUI has no default port: omitted (or 0)
+        # must disable it, an explicit port enables it.
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "No Comfy"\nhost = "a"\n'
+            '[[devices]]\nname = "Comfy"\nhost = "b"\ncomfyui_port = 8188\n'
+            '[[devices]]\nname = "Off"\nhost = "c"\ncomfyui_port = 0\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        no_comfy, comfy, off = cfg.devices
+        assert no_comfy.comfyui_port is None and no_comfy.comfyui_base is None
+        assert comfy.comfyui_base == "http://b:8188"
+        assert off.comfyui_port == 0 and off.comfyui_base is None
+
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
             '[[devices]]\nname = "A B"\nhost = "x"\n[[devices]]\nname = "a-b"\nhost = "y"\n'
@@ -457,6 +511,59 @@ class TestPoller:
         assert h["llm.model.qwen3-8-27b-bf16.mem_gb"]
         store.close()
 
+    async def test_comfyui_success(self):
+        def handler(request):
+            if request.url.path == "/queue":
+                return httpx.Response(200, json=COMFY_QUEUE)
+            return httpx.Response(200, json=COMFY_SYS)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None, comfyui_port=8188
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert state.comfy_ok is None
+        assert await poller._tick_fast() is True
+        assert state.comfy_ok is True
+        assert state.raw["comfyui"]["version"] == "0.3.59"
+        assert state.raw["comfyui"]["device_type"] == "mps"
+        assert state.raw["comfyui"]["queue_running"] == 1.0
+        assert state.raw["comfyui"]["queue_pending"] == 2.0
+        assert state.raw["comfyui"]["mem_gb"] == pytest.approx(1.0)
+        store.commit()
+        h = store.history("t", ["comfyui.model_mem_gb"], time.time() - 10, time.time() + 1)
+        assert h["comfyui.model_mem_gb"][-1][1] == pytest.approx(1.0)
+        store.close()
+
+    async def test_comfyui_failure_clears_stale_raw(self):
+        ok = {"comfy": True}
+
+        def handler(request):
+            if not ok["comfy"]:
+                raise httpx.ConnectError("connection refused")
+            if request.url.path == "/queue":
+                return httpx.Response(200, json=COMFY_QUEUE)
+            return httpx.Response(200, json=COMFY_SYS)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None, comfyui_port=8188
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert "comfyui" in state.raw
+
+        ok["comfy"] = False
+        assert await poller._tick_fast() is False
+        assert state.comfy_ok is False
+        # Stale values must not linger for the UI — the card marks ComfyUI
+        # unreachable instead of showing frozen queue depths.
+        assert "comfyui" not in state.raw
+
+        ok["comfy"] = True
+        assert await poller._tick_fast() is True
+        assert state.comfy_ok is True
+        assert "comfyui" in state.raw
+        store.close()
+
 
 class TestApi:
     def _client(self):
@@ -501,6 +608,26 @@ class TestApi:
             assert devs["serving"]["has_omlx"] is True
             assert devs["headless"]["omlx_admin_url"] is None
             assert devs["headless"]["has_omlx"] is False
+        store.close()
+
+    def test_devices_expose_comfyui_flags(self):
+        cfg = Config(devices=[
+            Device(name="Comfy", host="c", comfyui_port=8188),
+            Device(name="Plain", host="p"),
+        ])
+        store = Store.in_memory()
+        states = {}
+        for d in cfg.devices:
+            states[d.id] = DeviceState(d)
+            states[d.id].mark_ok()
+        states["comfy"].comfy_ok = True
+        app = create_app(cfg, store, states, start_pollers=False)
+        with TestClient(app) as client:
+            devs = {d["id"]: d for d in client.get("/api/devices").json()}
+            assert devs["comfy"]["has_comfyui"] is True
+            assert devs["comfy"]["comfy_ok"] is True
+            assert devs["plain"]["has_comfyui"] is False
+            assert devs["plain"]["comfy_ok"] is None
         store.close()
 
     def test_devices_expose_ip_fields(self):

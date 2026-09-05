@@ -9,12 +9,14 @@ fan and power metrics, with history (24 h full-resolution, 30 d rolled up).
 ## How it works
 
 ```
-┌──────────────┐   polls every 2–5 s over Tailscale    ┌─────────────────┐
-│  hub (this)  │ ────────────────────────────────────▶ │ Mac: omlx :8000 │
-│  FastAPI +   │   GET /admin/api/stats, /models        │     macmon:9090 │
-│  SQLite + JS │   GET http://<mac>:9090/json           └─────────────────┘
-└──────────────┘
+┌──────────────┐   polls every 2–5 s over Tailscale    ┌──────────────────────┐
+│  hub (this)  │ ────────────────────────────────────▶ │ Mac: omlx :8000      │
+│  FastAPI +   │   GET /admin/api/stats, /models        │      macmon :9090    │
+│  SQLite + JS │   GET http://<mac>:9090/json           │      ComfyUI :8188 * │
+└──────────────┘   GET http://<mac>:8188/queue, /system_stats (opt-in per device)
 ```
+
+\* ComfyUI polling is opt-in per device (`comfyui_port` in `hub.toml`).
 
 The Macs run **nothing new except `macmon serve`** (Rust, no sudo, negligible
 footprint). The hub is a single Python process with one SQLite file, so moving
@@ -53,6 +55,21 @@ omlx needs nothing further — just note its admin port and API key. Note that
 the MacBook will go to sleep; the hub marks it offline and backfills when it
 returns (that's expected, not an error). Don't bother enabling omlx auth for
 the hub's sake — the hub works fine without an API key if omlx has none.
+
+### ComfyUI (optional, per device)
+
+If a Mac also runs ComfyUI, the hub can show its queue depth and model memory
+alongside the omlx stats. By default ComfyUI binds to 127.0.0.1, which the hub
+can't reach over the tailnet — restart ComfyUI bound to the Mac's tailscale IP:
+
+```sh
+python main.py --listen $(tailscale ip -4 | head -1) --port 8188
+```
+
+(ComfyUI's `/queue` and `/system_stats` endpoints are unauthenticated, so only
+bind the tailnet IP — never `0.0.0.0`, especially on the MacBook.) Then add
+`comfyui_port = 8188` to that device's block in `hub.toml`. Nothing new runs on
+the Mac — the hub just polls the REST API ComfyUI already serves.
 
 > **Trust boundary:** the omlx admin port is key-protected by you; macmon and
 > this hub are unauthenticated read-only endpoints. All three rely on the

@@ -106,6 +106,20 @@ const LIVE_GROUPS = [
   ]],
 ];
 
+// Inserted between "inference" and "memory" only for comfyui-enabled devices.
+const COMFY_GROUP = ["comfyui", "layers", [
+  ["queue", (s, llm, d) => {
+    const c = comfyOf(d);
+    if (c) return `${Math.round(c.queue_running ?? 0)} running · ${Math.round(c.queue_pending ?? 0)} queued`;
+    return d.comfy_ok === false ? "unreachable" : "—";
+  }],
+  ["model memory", (s, llm, d) => {
+    const c = comfyOf(d);
+    return c ? fmtGB(c.mem_gb) : "—";
+  }],
+  ["version", (s, llm, d) => comfyOf(d)?.version || "—"],
+]];
+
 /* ---------- oMLX-style bits ---------- */
 const gbHTML = (v, dp) => (v == null ? "—" : `${v.toFixed(dp)}<span class="unit">GB</span>`);
 const BIG_STATS = [
@@ -222,6 +236,10 @@ function hwLineHTML(s, llm) {
   const wait = val(llm, "llm.waiting_reqs");
   return wait != null && wait > 0 ? `${num0(wait)} queued` : "";
 }
+
+// ComfyUI is opt-in per device; when unreachable the poller drops raw.comfyui
+// entirely (like stale macmon), so "no payload + comfy_ok false" = down.
+const comfyOf = (d) => (d && d.raw && d.raw.comfyui ? d.raw.comfyui : null);
 
 /* ---------- icons + theme ---------- */
 const ICONS = {
@@ -345,6 +363,15 @@ async function renderOverview() {
             <div class="stat"><span class="label">fan speed</span><span class="value i-val" data-p="fan">—</span></div>
           </div>
         </div>
+        ${d.has_comfyui ? `
+        <div class="ov-sec sec-comfy">
+          <div class="ov-sec-head">${icon("layers")}<span class="kicker">comfyui</span></div>
+          <div class="i-stats">
+            <div class="stat"><span class="label">running</span><span class="value i-val" data-c="run">—</span></div>
+            <div class="stat"><span class="label">queued</span><span class="value i-val" data-c="pend">—</span></div>
+            <div class="stat"><span class="label">model memory</span><span class="value i-val" data-c="mem">—</span></div>
+          </div>
+        </div>` : ""}
       </div>
     `;
     grid.appendChild(card);
@@ -362,6 +389,8 @@ async function renderOverview() {
     for (const el of card.querySelectorAll(".i-val[data-i]")) iEls[el.dataset.i] = el;
     const pEls = {};
     for (const el of card.querySelectorAll(".i-val[data-p]")) pEls[el.dataset.p] = el;
+    const cEls = {};
+    for (const el of card.querySelectorAll(".i-val[data-c]")) cEls[el.dataset.c] = el;
     const ramValEl = card.querySelector(".mbar-val");
     const ramFillEl = card.querySelector(".mbar-fill");
     const cpuValEl = card.querySelector(".cpu-val");
@@ -431,6 +460,20 @@ async function renderOverview() {
       const withTemp = (pctText, t) => (pctText === "—" || t == null ? pctText : `${pctText} · ${fmtTemp(t)}`);
       setBar(cpuValEl, cpuFillEl, cpu != null ? cpu * 100 : null, withTemp(fmtPct(cpu), cTemp));
       setBar(gpuValEl, gpuFillEl, gpu != null ? gpu * 100 : null, withTemp(fmtPct(gpu), gTemp));
+
+      const c = comfyOf(fresh);
+      if (cEls.run) {
+        if (c) {
+          cEls.run.textContent = Math.round(c.queue_running ?? 0);
+          cEls.pend.textContent = Math.round(c.queue_pending ?? 0);
+          cEls.mem.innerHTML = c.mem_gb == null ? "—" : gbHTML(c.mem_gb, 1);
+        } else {
+          const down = fresh.comfy_ok === false;
+          cEls.run.textContent = down ? "unreachable" : "—";
+          cEls.pend.textContent = "—";
+          cEls.mem.textContent = "—";
+        }
+      }
 
       hwEl.innerHTML = hwLineHTML(s, llm);
       agoEl.textContent = fresh.online ? "" : `last seen ${ago(fresh.last_seen)}`;
@@ -517,6 +560,8 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "KV cache", metrics: ["llm.cached_tokens"], labels: ["cached tokens"], omlx: true, fmt: fmtAxisTokens },
     { title: "Cache efficiency", metrics: ["llm.cache_eff"], labels: ["hit rate"], omlx: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "Requests", metrics: ["llm.active_reqs", "llm.waiting_reqs"], labels: ["active", "waiting"], omlx: true, fmt: (v) => v.toFixed(0) },
+    { title: "ComfyUI queue", metrics: ["comfyui.queue_running", "comfyui.queue_pending"], labels: ["running", "queued"], comfy: true, fmt: (v) => v.toFixed(0) },
+    { title: "ComfyUI model memory", metrics: ["comfyui.model_mem_gb"], labels: ["models"], comfy: true, fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Fan", metrics: ["sys.fan_rpm_max"], labels: ["rpm"], macmon: true, fmt: (v) => `${v.toLocaleString()} rpm` },
   ];
 
@@ -552,7 +597,9 @@ async function renderDetail(id, initialRange = "1h") {
       </div>`;
     view.innerHTML = head;
     view.querySelector("#big").innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
-    view.querySelector("#live").innerHTML = LIVE_GROUPS.map(([title, iconName, stats]) =>
+    const liveGroups = [...LIVE_GROUPS];
+    if (d.has_comfyui) liveGroups.splice(1, 0, COMFY_GROUP);
+    view.querySelector("#live").innerHTML = liveGroups.map(([title, iconName, stats]) =>
       `<div class="panel live-group"><div class="panel-head">${icon(iconName)}<span class="kicker">${title}</span></div><div class="live-group-body">${stats.map(([label]) => stat(label, "")).join("")}</div></div>`
     ).join("");
     view.querySelectorAll(".segments button").forEach((b) => {
@@ -572,7 +619,9 @@ async function renderDetail(id, initialRange = "1h") {
     for (const p of panels) {
       const div = document.createElement("div");
       div.className = "panel";
-      const right = d.has_omlx === false && p.omlx ? `<span class="head-right">no oMLX</span>` : "";
+      let right = "";
+      if (d.has_omlx === false && p.omlx) right = `<span class="head-right">no oMLX</span>`;
+      else if (d.has_comfyui === false && p.comfy) right = `<span class="head-right">no ComfyUI</span>`;
       div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas><div class="chart-stats"></div></div>`;
       panelsDiv.appendChild(div);
       charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt });
@@ -580,7 +629,7 @@ async function renderDetail(id, initialRange = "1h") {
       statsEls[p.title] = div.querySelector(".chart-stats");
     }
 
-    return { d, charts, statsEls };
+    return { d, charts, statsEls, groups: liveGroups };
   }
 
   let ctx;
@@ -635,7 +684,7 @@ async function renderDetail(id, initialRange = "1h") {
       const cells = view.querySelectorAll("#live .stat .value");
       if (cells.length) {
         let i = 0;
-        for (const [, , stats] of LIVE_GROUPS) {
+        for (const [, , stats] of ctx.groups) {
           for (const [, fn] of stats) {
             if (cells[i]) cells[i].textContent = fn(s, llm, d);
             i++;
