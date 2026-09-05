@@ -120,6 +120,23 @@ const COMFY_GROUP = ["comfyui", "layers", [
   ["version", (s, llm, d) => comfyOf(d)?.version || "—"],
 ]];
 
+// Same slot, only for llama-server-enabled devices. Separate from "inference"
+// (which is omlx) — a box can run both at once, on different ports.
+const LLAMACPP_GROUP = ["llama.cpp", "layers", [
+  ["model", (s, llm, d) => llamacppOf(d)?.model || (d.llamacpp_ok === false ? "unreachable" : "—")],
+  ["generation", (s, llm, d) => fmtTps(llamacppOf(d)?.gen_tps)],
+  ["prefill", (s, llm, d) => fmtTps(llamacppOf(d)?.prefill_tps)],
+  ["kv cache", (s, llm, d) => {
+    const pct = llamacppOf(d)?.kv_used_pct;
+    return pct != null ? `${(pct * 100).toFixed(0)}%` : "—";
+  }],
+  ["requests", (s, llm, d) => {
+    const lc = llamacppOf(d);
+    if (!lc || lc.active_reqs == null) return d.llamacpp_ok === false ? "unreachable" : "—";
+    return `${num0(lc.active_reqs)} active · ${num0(lc.waiting_reqs ?? 0)} waiting`;
+  }],
+]];
+
 /* ---------- oMLX-style bits ---------- */
 const gbHTML = (v, dp) => (v == null ? "—" : `${v.toFixed(dp)}<span class="unit">GB</span>`);
 const BIG_STATS = [
@@ -240,6 +257,8 @@ function hwLineHTML(s, llm) {
 // ComfyUI is opt-in per device; when unreachable the poller drops raw.comfyui
 // entirely (like stale macmon), so "no payload + comfy_ok false" = down.
 const comfyOf = (d) => (d && d.raw && d.raw.comfyui ? d.raw.comfyui : null);
+// Same contract for llama-server: no raw.llamacpp + llamacpp_ok false = down.
+const llamacppOf = (d) => (d && d.raw && d.raw.llamacpp ? d.raw.llamacpp : null);
 
 /* ---------- icons + theme ---------- */
 const ICONS = {
@@ -372,6 +391,17 @@ async function renderOverview() {
             <div class="stat"><span class="label">model memory</span><span class="value i-val" data-c="mem">—</span></div>
           </div>
         </div>` : ""}
+        ${d.has_llamacpp ? `
+        <div class="ov-sec sec-llamacpp">
+          <div class="ov-sec-head">${icon("layers")}<span class="kicker">llama.cpp</span></div>
+          <div class="i-stats">
+            <div class="stat"><span class="label">generation</span><span class="value i-val" data-l="gen">—</span></div>
+            <div class="stat"><span class="label">prefill</span><span class="value i-val" data-l="pre">—</span></div>
+            <div class="stat"><span class="label">kv cache</span><span class="value i-val" data-l="kv">—</span></div>
+            <div class="stat"><span class="label">requests</span><span class="value i-val" data-l="req">—</span></div>
+            <div class="stat"><span class="label">model</span><span class="value i-val" data-l="mdl">—</span></div>
+          </div>
+        </div>` : ""}
       </div>
     `;
     grid.appendChild(card);
@@ -391,6 +421,8 @@ async function renderOverview() {
     for (const el of card.querySelectorAll(".i-val[data-p]")) pEls[el.dataset.p] = el;
     const cEls = {};
     for (const el of card.querySelectorAll(".i-val[data-c]")) cEls[el.dataset.c] = el;
+    const lEls = {};
+    for (const el of card.querySelectorAll(".i-val[data-l]")) lEls[el.dataset.l] = el;
     const ramValEl = card.querySelector(".mbar-val");
     const ramFillEl = card.querySelector(".mbar-fill");
     const cpuValEl = card.querySelector(".cpu-val");
@@ -472,6 +504,24 @@ async function renderOverview() {
           cEls.run.textContent = down ? "unreachable" : "—";
           cEls.pend.textContent = "—";
           cEls.mem.textContent = "—";
+        }
+      }
+
+      const lc = llamacppOf(fresh);
+      if (lEls.gen) {
+        if (lc) {
+          big(lEls.gen, lc.gen_tps == null ? null : lc.gen_tps.toFixed(1), "t/s");
+          big(lEls.pre, lc.prefill_tps == null ? null : lc.prefill_tps.toFixed(1), "t/s");
+          lEls.kv.textContent = lc.kv_used_pct == null ? "—" : `${(lc.kv_used_pct * 100).toFixed(0)}%`;
+          lEls.req.textContent = lc.active_reqs == null ? "—" : `${Math.round(lc.active_reqs)}a · ${Math.round(lc.waiting_reqs ?? 0)}w`;
+          lEls.mdl.textContent = lc.model || "—";
+        } else {
+          const down = fresh.llamacpp_ok === false;
+          lEls.gen.textContent = down ? "unreachable" : "—";
+          lEls.pre.textContent = "—";
+          lEls.kv.textContent = "—";
+          lEls.req.textContent = "—";
+          lEls.mdl.textContent = "—";
         }
       }
 
@@ -562,6 +612,10 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "Requests", metrics: ["llm.active_reqs", "llm.waiting_reqs"], labels: ["active", "waiting"], omlx: true, fmt: (v) => v.toFixed(0) },
     { title: "ComfyUI queue", metrics: ["comfyui.queue_running", "comfyui.queue_pending"], labels: ["running", "queued"], comfy: true, fmt: (v) => v.toFixed(0) },
     { title: "ComfyUI model memory", metrics: ["comfyui.model_mem_gb"], labels: ["models"], comfy: true, fmt: (v) => `${v.toFixed(1)} GB` },
+    { title: "llamacpp throughput", metrics: ["llamacpp.prefill_tps", "llamacpp.gen_tps"], labels: ["prefill", "generation"], llamacpp: true, fmt: (v) => `${v.toFixed(1)} t/s` },
+    { title: "llamacpp KV cache", metrics: ["llamacpp.kv_used_pct"], labels: ["used"], pct: true, llamacpp: true, fmt: (v) => `${v.toFixed(0)}%` },
+    { title: "llamacpp requests", metrics: ["llamacpp.active_reqs", "llamacpp.waiting_reqs"], labels: ["active", "waiting"], llamacpp: true, fmt: (v) => v.toFixed(0) },
+    { title: "llamacpp tokens", metrics: ["llamacpp.prompt_tokens", "llamacpp.gen_tokens"], labels: ["prompt", "generated"], llamacpp: true, fmt: fmtAxisTokens },
     { title: "Fan", metrics: ["sys.fan_rpm_max"], labels: ["rpm"], macmon: true, fmt: (v) => `${v.toLocaleString()} rpm` },
   ];
 
@@ -599,6 +653,7 @@ async function renderDetail(id, initialRange = "1h") {
     view.querySelector("#big").innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
     const liveGroups = [...LIVE_GROUPS];
     if (d.has_comfyui) liveGroups.splice(1, 0, COMFY_GROUP);
+    if (d.has_llamacpp) liveGroups.splice(d.has_comfyui ? 2 : 1, 0, LLAMACPP_GROUP);
     view.querySelector("#live").innerHTML = liveGroups.map(([title, iconName, stats]) =>
       `<div class="panel live-group"><div class="panel-head">${icon(iconName)}<span class="kicker">${title}</span></div><div class="live-group-body">${stats.map(([label]) => stat(label, "")).join("")}</div></div>`
     ).join("");
@@ -622,6 +677,7 @@ async function renderDetail(id, initialRange = "1h") {
       let right = "";
       if (d.has_omlx === false && p.omlx) right = `<span class="head-right">no oMLX</span>`;
       else if (d.has_comfyui === false && p.comfy) right = `<span class="head-right">no ComfyUI</span>`;
+      else if (d.has_llamacpp === false && p.llamacpp) right = `<span class="head-right">no llama.cpp</span>`;
       div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas><div class="chart-stats"></div></div>`;
       panelsDiv.appendChild(div);
       charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt });

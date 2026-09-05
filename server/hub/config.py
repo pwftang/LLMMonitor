@@ -19,6 +19,8 @@ class Device:
     macmon_port: int | None = 9090
     # ComfyUI is opt-in: most machines don't run it, so no port → no polling.
     comfyui_port: int | None = None
+    # llama-server (llama.cpp) is opt-in the same way; needs --metrics enabled.
+    llamacpp_port: int | None = None
     api_key: str | None = None
     # Optional stable id; defaults to a slug of `name`. Set explicitly so a
     # display-name change doesn't orphan this device's stored history.
@@ -45,6 +47,12 @@ class Device:
         if not self.comfyui_port:
             return None
         return f"http://{self.host}:{self.comfyui_port}"
+
+    @property
+    def llamacpp_base(self) -> str | None:
+        if not self.llamacpp_port:
+            return None
+        return f"http://{self.host}:{self.llamacpp_port}"
 
 
 @dataclass
@@ -118,6 +126,8 @@ def load(path: str | os.PathLike | None = None) -> Config:
             macmon_port=d.get("macmon_port", 9090),
             # ComfyUI is different: omitted (or 0) → disabled; it's opt-in.
             comfyui_port=d.get("comfyui_port"),
+            # Same opt-in rule for llama-server.
+            llamacpp_port=d.get("llamacpp_port"),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )
@@ -145,6 +155,6 @@ def _mock_devices() -> list[Device]:
     # the payload mirrors a real device (has_omlx, omlx_admin_url).
     return [
         Device(name="Mock Studio A", host="127.0.0.1", omlx_port=8080, macmon_port=9090, comfyui_port=8188),
-        Device(name="Mock Studio B", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
+        Device(name="Mock Studio B", host="127.0.0.1", omlx_port=8080, macmon_port=9090, llamacpp_port=8085),
         Device(name="Mock MacBook", host="127.0.0.1", omlx_port=8080, macmon_port=9090),
     ]

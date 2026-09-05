@@ -1,16 +1,18 @@
-"""Poll one device: macmon /json + omlx admin API + ComfyUI → metrics + latest state.
+"""Poll one device: macmon /json + omlx admin API + ComfyUI + llama-server → metrics + latest state.
 
 Metric namespaces written to the store:
   sys.*   — macmon system metrics (kind="system")
   llm.*   — omlx /admin/api/stats (kind="llm")
   llm.model.<slug>.* — per-model series from /admin/api/models (kind="models")
   comfyui.* — ComfyUI /queue + /system_stats (kind="comfyui"; opt-in per device)
+  llamacpp.* — llama-server Prometheus /metrics (kind="llamacpp"; opt-in per device)
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import socket
 import time
 from typing import Any
@@ -32,8 +34,6 @@ async def _resolve_ipv4(name: str) -> str | None:
 
 
 def _slug(text: str) -> str:
-    import re
-
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
@@ -166,6 +166,100 @@ def extract_comfyui(queue: dict, stats: dict) -> dict[str, float]:
     return out
 
 
+_PROM_SAMPLE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+(\S+)")
+
+
+def parse_prometheus(text: str) -> dict[str, float]:
+    """Minimal Prometheus text-exposition parser: metric name → value.
+
+    Only covers what llama-server's /metrics emits: plain samples, no
+    timestamps. Labelled series collapse to their last sample — llama.cpp's
+    core metrics are unlabelled, so that isn't a limitation in practice.
+    NaN/Inf samples are dropped.
+    """
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        m = _PROM_SAMPLE.match(line)
+        if not m:
+            continue
+        try:
+            value = float(m.group(2))
+        except ValueError:
+            continue
+        if value == value and value not in (float("inf"), float("-inf")):
+            out[m.group(1)] = value
+    return out
+
+
+def extract_llamacpp(
+    counters: dict[str, float],
+    prev: tuple[float, dict[str, float]] | None,
+    now: float,
+) -> dict[str, float]:
+    """llama-server /metrics → llamacpp.* series.
+
+    Throughput is derived from cumulative counters: tokens processed per
+    second of *active work* (Δ tokens_total / Δ seconds_total), falling back
+    to wall-clock rate when a server build doesn't expose the seconds
+    counters. First poll after (re)start has no previous sample, so tps
+    series appear from the second poll onwards.
+    """
+    out: dict[str, float] = {}
+
+    def add(key: str, v: Any) -> None:
+        if isinstance(v, (int, float)):
+            out[key] = float(v)
+
+    add("llamacpp.prompt_tokens", counters.get("llamacpp:prompt_tokens_total"))
+    add("llamacpp.gen_tokens", counters.get("llamacpp:tokens_predicted_total"))
+    add("llamacpp.active_reqs", counters.get("llamacpp:requests_processing"))
+    add("llamacpp.waiting_reqs", counters.get("llamacpp:requests_deferred"))
+    add("llamacpp.kv_used_tokens", counters.get("llamacpp:kv_cache_tokens"))
+    add("llamacpp.kv_used_pct", counters.get("llamacpp:kv_cache_usage_ratio"))
+
+    if prev is None:
+        return out
+    prev_ts, prev_counters = prev
+
+    def rate(tokens_key: str, seconds_key: str) -> float | None:
+        tokens = counters.get(tokens_key)
+        prev_tokens = prev_counters.get(tokens_key)
+        if tokens is None or prev_tokens is None:
+            return None
+        d_tok = tokens - prev_tokens
+        if d_tok < 0:  # counter reset — llama-server restarted between polls
+            return None
+        d_sec = None
+        sec, prev_sec = counters.get(seconds_key), prev_counters.get(seconds_key)
+        if sec is not None and prev_sec is not None and sec - prev_sec >= 0:
+            d_sec = sec - prev_sec
+        else:
+            d_sec = now - prev_ts
+        return d_tok / d_sec if d_sec > 0 else None
+
+    add("llamacpp.prefill_tps", rate("llamacpp:prompt_tokens_total", "llamacpp:prompt_seconds_total"))
+    add(
+        "llamacpp.gen_tps",
+        rate("llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted_seconds_total"),
+    )
+    return out
+
+
+def llamacpp_model_name(props: dict) -> str | None:
+    """Identify the loaded model from llama-server /props."""
+    alias = props.get("model_alias")
+    if isinstance(alias, str) and alias:
+        return alias
+    dgs = props.get("default_generation_settings")
+    if isinstance(dgs, dict):
+        model = dgs.get("model")
+        if isinstance(model, str) and model:
+            return model
+    return None
+
+
 class DeviceState:
     """Latest known state for one device; served by the REST API."""
 
@@ -183,6 +277,7 @@ class DeviceState:
         self.macmon_ok: bool | None = None
         self.macmon_last_ok: float | None = None
         self.comfy_ok: bool | None = None
+        self.llamacpp_ok: bool | None = None
         self.system: dict[str, float] = {}
         self.llm: dict[str, float] = {}
         self.raw: dict[str, Any] = {}
@@ -205,7 +300,9 @@ class DeviceState:
             "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
             "has_comfyui": self.device.comfyui_base is not None,
+            "has_llamacpp": self.device.llamacpp_base is not None,
             "comfy_ok": self.comfy_ok,
+            "llamacpp_ok": self.llamacpp_ok,
             "omlx_admin_url": f"{base}/admin" if base else None,
             "tailscale_ip": self.tailscale_ip,
             "local_ip": self.local_ip,
@@ -234,6 +331,9 @@ class DevicePoller:
         self._version_fetched_at = 0.0
         self._ips_resolved_at = 0.0
         self._client: httpx.AsyncClient | None = None
+        # Previous /metrics sample for llama.cpp rate derivation (counters
+        # are cumulative, so throughput needs a before/after).
+        self._llamacpp_prev: tuple[float, dict[str, float]] | None = None
 
     async def run(self) -> None:
         log.info("poller started for %s", self.device.id)
@@ -313,13 +413,15 @@ class DevicePoller:
             ok |= await self._tick_omlx_stats()
         if self.device.comfyui_base:
             ok |= await self._tick_comfyui()
+        if self.device.llamacpp_base:
+            ok |= await self._tick_llamacpp()
         if ok:
             self.state.mark_ok()
         else:
             self.state.mark_offline("unreachable")
-            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s)",
+            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s llamacpp=%s)",
                         self.device.id, self.device.macmon_url, self.device.omlx_base,
-                        self.device.comfyui_base)
+                        self.device.comfyui_base, self.device.llamacpp_base)
         return ok
 
     async def _tick_macmon(self) -> bool:
@@ -380,6 +482,51 @@ class DevicePoller:
             "mem_gb": series.get("comfyui.model_mem_gb"),
         }
         self.store.insert(self.device.id, time.time(), "comfyui", series)
+        return True
+
+    async def _tick_llamacpp(self) -> bool:
+        assert self._client is not None and self.device.llamacpp_base is not None
+        was_ok = self.state.llamacpp_ok
+        try:
+            metrics_r, props_r = await asyncio.gather(
+                self._client.get(self.device.llamacpp_base + "/metrics"),
+                self._client.get(self.device.llamacpp_base + "/props"),
+            )
+            metrics_r.raise_for_status()
+            props_r.raise_for_status()
+            counters = parse_prometheus(metrics_r.text)
+            props = props_r.json()
+            if not counters:
+                raise ValueError("llamacpp /metrics returned no samples")
+            if not isinstance(props, dict):
+                raise ValueError("llamacpp /props returned non-object payload")
+        except Exception as e:  # noqa: BLE001
+            if was_ok is not False:
+                log.warning("%s llamacpp unreachable: %s", self.device.id, e)
+            self.state.llamacpp_ok = False
+            self.state.raw.pop("llamacpp", None)
+            # Forget the baseline so a restarted server (reset counters)
+            # doesn't produce a bogus rate on recovery.
+            self._llamacpp_prev = None
+            return False
+        if was_ok is False:
+            log.info("%s llamacpp recovered", self.device.id)
+        self.state.llamacpp_ok = True
+        now = time.time()
+        series = extract_llamacpp(counters, self._llamacpp_prev, now)
+        self._llamacpp_prev = (now, counters)
+        self.state.raw["llamacpp"] = {
+            "model": llamacpp_model_name(props),
+            "gen_tps": series.get("llamacpp.gen_tps"),
+            "prefill_tps": series.get("llamacpp.prefill_tps"),
+            "kv_used_pct": series.get("llamacpp.kv_used_pct"),
+            "kv_used_tokens": series.get("llamacpp.kv_used_tokens"),
+            "prompt_tokens": series.get("llamacpp.prompt_tokens"),
+            "gen_tokens": series.get("llamacpp.gen_tokens"),
+            "active_reqs": series.get("llamacpp.active_reqs"),
+            "waiting_reqs": series.get("llamacpp.waiting_reqs"),
+        }
+        self.store.insert(self.device.id, now, "llamacpp", series)
         return True
 
     async def _tick_omlx_stats(self) -> bool:
