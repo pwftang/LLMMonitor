@@ -259,6 +259,8 @@ a { color: var(--blue); text-decoration: none; }
 }
 
 /* subgrid rows align matching .ov-sec panels across all device cards in a row */
+/* grid-row spans must equal the number of .ov-sec sections (+1 for .card-head);
+   overflow:hidden clips anything that falls outside the spanned rows */
 .card {
   padding: 0;
   cursor: pointer;
@@ -268,6 +270,7 @@ a { color: var(--blue); text-decoration: none; }
   grid-row: span 5;
   row-gap: 0;
 }
+.card.has-comfy { grid-row: span 6; }
 .card:hover { border-color: var(--muted); }
 .card.offline { opacity: 0.55; cursor: default; }
 
@@ -327,6 +330,7 @@ a { color: var(--blue); text-decoration: none; }
   grid-template-rows: subgrid;
   grid-row: span 4;
 }
+.card.has-comfy .card-body { grid-row: span 5; }
 
 .ov-sec {
   background: var(--surface);

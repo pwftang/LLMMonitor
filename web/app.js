@@ -306,7 +306,8 @@ async function renderOverview() {
 
   for (const d of devices) {
     const card = document.createElement("div");
-    card.className = "card" + (d.online ? "" : " offline");
+    card.className =
+      "card" + (d.online ? "" : " offline") + (d.has_comfyui ? " has-comfy" : "");
     card.onclick = () => (location.hash = `#/device/${encodeURIComponent(d.id)}`);
 
     card.innerHTML = `
