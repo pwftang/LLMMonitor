@@ -5,17 +5,27 @@ Metric namespaces written to the store:
   llm.*   — omlx /admin/api/stats (kind="llm")
   llm.model.<slug>.* — per-model series from /admin/api/models (kind="models")
   comfyui.* — ComfyUI /queue + /system_stats (kind="comfyui"; opt-in per device)
+
+Run progress (current render's step count) is not on ComfyUI's REST API — it
+is only pushed over the /ws WebSocket, so a per-device watch loop feeds it
+into device state.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 import time
 from typing import Any
 
 import httpx
+
+try:
+    import websockets
+except ImportError:  # pragma: no cover — dependency, but degrade gracefully
+    websockets = None
 
 from .config import Config, Device
 from .db import Store
@@ -183,6 +193,9 @@ class DeviceState:
         self.macmon_ok: bool | None = None
         self.macmon_last_ok: float | None = None
         self.comfy_ok: bool | None = None
+        # Live render progress pushed by the ComfyUI /ws watch loop:
+        # {"step", "total", "node", "started_at", "elapsed_s"} while running.
+        self.comfy_progress: dict[str, Any] | None = None
         self.system: dict[str, float] = {}
         self.llm: dict[str, float] = {}
         self.raw: dict[str, Any] = {}
@@ -234,6 +247,10 @@ class DevicePoller:
         self._version_fetched_at = 0.0
         self._ips_resolved_at = 0.0
         self._client: httpx.AsyncClient | None = None
+        # Prompt-graph node titles, resolved lazily per prompt_id so WS
+        # "executing" node ids ("12") become graph titles ("KSampler").
+        self._comfy_node_titles: dict[str, str] = {}
+        self._comfy_titles_prompt_id: str | None = None
 
     async def run(self) -> None:
         log.info("poller started for %s", self.device.id)
@@ -244,6 +261,8 @@ class DevicePoller:
             tasks = [asyncio.create_task(self._fast_loop())]
             if self.device.omlx_base:
                 tasks.append(asyncio.create_task(self._models_loop()))
+            if self.device.comfyui_base and websockets is not None:
+                tasks.append(asyncio.create_task(self._comfy_ws_loop()))
             await asyncio.gather(*tasks)
 
     async def _fast_loop(self) -> None:
@@ -365,6 +384,7 @@ class DevicePoller:
             if was_ok is not False:
                 log.warning("%s comfyui unreachable: %s", self.device.id, e)
             self.state.comfy_ok = False
+            self.state.comfy_progress = None
             self.state.raw.pop("comfyui", None)
             return False
         if was_ok is False:
@@ -379,8 +399,109 @@ class DevicePoller:
             "queue_pending": series["comfyui.queue_pending"],
             "mem_gb": series.get("comfyui.model_mem_gb"),
         }
+        progress = self._live_comfy_progress()
+        if progress is not None:
+            self.state.raw["comfyui"]["progress"] = progress
         self.store.insert(self.device.id, time.time(), "comfyui", series)
         return True
+
+    def _live_comfy_progress(self) -> dict[str, Any] | None:
+        """comfy_progress snapshot with elapsed_s computed at merge time."""
+        p = self.state.comfy_progress
+        if p is None:
+            return None
+        return {**p, "elapsed_s": max(0.0, time.time() - p["started_at"])}
+
+    async def _comfy_ws_loop(self) -> None:
+        """Watch ComfyUI's /ws feed for live run progress (step counts, node).
+
+        ComfyUI broadcasts execution events to every connected client with no
+        subscription step. Reconnects forever with a bounded backoff; only the
+        REST poll's success/failure drives state.comfy_ok, so this loop never
+        touches device health itself.
+        """
+        assert self.device.comfyui_base is not None
+        url = self.device.comfyui_base.replace("http", "ws", 1) + "/ws"
+        backoff = 1.0
+        while True:
+            try:
+                async with websockets.connect(url, close_timeout=5) as ws:
+                    backoff = 1.0
+                    async for raw in ws:
+                        self._handle_comfy_ws(raw)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s comfyui ws dropped: %s", self.device.id, e)
+                self.state.comfy_progress = None
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.cfg.offline_backoff)
+
+    def _handle_comfy_ws(self, raw: str | bytes) -> None:
+        if not isinstance(raw, str):
+            return  # ComfyUI pushes binary JPEG previews on the same socket
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(msg, dict) or not isinstance(msg.get("data"), dict):
+            return
+        typ, data = msg.get("type"), msg["data"]
+        state = self.state
+        if typ == "execution_start":
+            state.comfy_progress = {
+                "step": 0,
+                "total": 0,
+                "node": None,
+                "started_at": time.time(),
+            }
+            pid = data.get("prompt_id")
+            if isinstance(pid, str):
+                asyncio.get_running_loop().create_task(self._resolve_comfy_titles(pid))
+        elif typ == "executing":
+            node = data.get("node")
+            if node is None:
+                state.comfy_progress = None  # current prompt finished
+            elif state.comfy_progress is not None:
+                state.comfy_progress["node"] = self._comfy_node_titles.get(node, node)
+        elif typ == "progress":
+            if state.comfy_progress is not None:
+                v, m = data.get("value"), data.get("max")
+                if isinstance(v, (int, float)) and isinstance(m, (int, float)):
+                    state.comfy_progress["step"] = int(v)
+                    state.comfy_progress["total"] = int(m)
+        elif typ in ("execution_error", "execution_interrupted"):
+            state.comfy_progress = None
+
+    async def _resolve_comfy_titles(self, prompt_id: str) -> None:
+        """Fetch the prompt graph once per run to map node ids → titles."""
+        if prompt_id == self._comfy_titles_prompt_id or self._client is None:
+            return
+        self._comfy_titles_prompt_id = prompt_id
+        try:
+            data = await self._comfy_get(f"/history/{prompt_id}")
+        except Exception as e:  # noqa: BLE001
+            log.debug("%s comfyui history fetch failed: %s", self.device.id, e)
+            return
+        entry = data.get(prompt_id) if isinstance(data, dict) else None
+        prompt = (entry or {}).get("prompt")
+        graph = prompt[2] if isinstance(prompt, list) and len(prompt) > 2 else None
+        if not isinstance(graph, dict):
+            return
+        titles: dict[str, str] = {}
+        for node_id, node in graph.items():
+            if not isinstance(node, dict):
+                continue
+            meta = node.get("_meta")
+            title = meta.get("title") if isinstance(meta, dict) else None
+            titles[node_id] = title if isinstance(title, str) and title else node.get("class_type", node_id)
+        self._comfy_node_titles = titles
+
+    async def _comfy_get(self, path: str) -> Any:
+        assert self._client is not None and self.device.comfyui_base is not None
+        r = await self._client.get(self.device.comfyui_base + path)
+        r.raise_for_status()
+        return r.json()
 
     async def _tick_omlx_stats(self) -> bool:
         try:

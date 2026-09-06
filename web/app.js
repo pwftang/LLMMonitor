@@ -113,6 +113,14 @@ const COMFY_GROUP = ["comfyui", "layers", [
     if (c) return `${Math.round(c.queue_running ?? 0)} running · ${Math.round(c.queue_pending ?? 0)} queued`;
     return d.comfy_ok === false ? "unreachable" : "—";
   }],
+  ["run", (s, llm, d) => {
+    const p = comfyOf(d)?.progress;
+    if (!p || !p.total) return "—";
+    const bits = [`step ${p.step}/${p.total}`];
+    if (p.node) bits.push(p.node);
+    if (p.elapsed_s != null) bits.push(`${p.elapsed_s.toFixed(0)}s`);
+    return bits.join(" · ");
+  }],
   ["model memory", (s, llm, d) => {
     const c = comfyOf(d);
     return c ? fmtGB(c.mem_gb) : "—";
@@ -372,6 +380,10 @@ async function renderOverview() {
             <div class="stat"><span class="label">queued</span><span class="value i-val" data-c="pend">—</span></div>
             <div class="stat"><span class="label">model memory</span><span class="value i-val" data-c="mem">—</span></div>
           </div>
+          <div class="comfy-prog" hidden>
+            <div class="comfy-prog-line"><span class="comfy-prog-text i-val" data-c="prog"></span></div>
+            <div class="mbar mbar-use comfy-bar"><div class="mbar-fill" style="width:0%"></div></div>
+          </div>
         </div>` : ""}
       </div>
     `;
@@ -392,6 +404,8 @@ async function renderOverview() {
     for (const el of card.querySelectorAll(".i-val[data-p]")) pEls[el.dataset.p] = el;
     const cEls = {};
     for (const el of card.querySelectorAll(".i-val[data-c]")) cEls[el.dataset.c] = el;
+    const comfyProgEl = card.querySelector(".comfy-prog");
+    const comfyBarFillEl = comfyProgEl ? comfyProgEl.querySelector(".mbar-fill") : null;
     const ramValEl = card.querySelector(".mbar-val");
     const ramFillEl = card.querySelector(".mbar-fill");
     const cpuValEl = card.querySelector(".cpu-val");
@@ -473,6 +487,18 @@ async function renderOverview() {
           cEls.run.textContent = down ? "unreachable" : "—";
           cEls.pend.textContent = "—";
           cEls.mem.textContent = "—";
+        }
+      }
+      if (comfyProgEl) {
+        const p = c && c.progress;
+        const on = p && p.total > 0;
+        comfyProgEl.hidden = !on;
+        if (on) {
+          const bits = [`step ${p.step}/${p.total} (${Math.round((p.step / p.total) * 100)}%)`];
+          if (p.node) bits.push(p.node);
+          if (p.elapsed_s != null) bits.push(`${p.elapsed_s.toFixed(0)}s`);
+          cEls.prog.textContent = bits.join(" · ");
+          comfyBarFillEl.style.width = `${((p.step / p.total) * 100).toFixed(1)}%`;
         }
       }
 

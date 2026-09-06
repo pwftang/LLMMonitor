@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import time
 from unittest.mock import AsyncMock, patch
@@ -562,6 +563,99 @@ class TestPoller:
         assert await poller._tick_fast() is True
         assert state.comfy_ok is True
         assert "comfyui" in state.raw
+        store.close()
+
+
+class TestComfyRunProgress:
+    def _poller(self, handler=None):
+        device = Device(name="T", host="h", omlx_port=None, macmon_port=None, comfyui_port=8188)
+        cfg = Config()
+        store = Store.in_memory()
+        state = DeviceState(device)
+        poller = DevicePoller(device, cfg, store, state)
+        poller._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler or (lambda r: httpx.Response(404))),
+            base_url="",
+        )
+        return poller, state, store
+
+    def _frame(self, typ, **data):
+        return json.dumps({"type": typ, "data": data})
+
+    async def test_run_lifecycle(self):
+        poller, state, store = self._poller()
+        poller._handle_comfy_ws(self._frame("execution_start", prompt_id="p1"))
+        assert state.comfy_progress["step"] == 0
+        started = state.comfy_progress["started_at"]
+
+        poller._handle_comfy_ws(self._frame("progress", value=7, max=30, prompt_id="p1", node="9"))
+        poller._handle_comfy_ws(self._frame("executing", node="9", prompt_id="p1"))
+        # No graph fetched (the history task is fire-and-forget) → raw node id.
+        assert state.comfy_progress["node"] == "9"
+        time.sleep(0.01)
+        merged = poller._live_comfy_progress()
+        assert merged["step"] == 7
+        assert merged["total"] == 30
+        assert merged["elapsed_s"] >= time.time() - started - 0.001
+
+        poller._handle_comfy_ws(self._frame("executing", node=None, prompt_id="p1"))
+        assert state.comfy_progress is None
+        assert poller._live_comfy_progress() is None
+        store.close()
+
+    def test_binary_and_garbage_frames_ignored(self):
+        poller, state, store = self._poller()
+        poller._handle_comfy_ws(b"\x89PNG\r\n jpeg preview bytes")
+        poller._handle_comfy_ws("not json")
+        poller._handle_comfy_ws(json.dumps({"type": "progress", "data": "nope"}))
+        assert state.comfy_progress is None
+        store.close()
+
+    async def test_error_clears_progress(self):
+        poller, state, store = self._poller()
+        poller._handle_comfy_ws(self._frame("execution_start", prompt_id="p1"))
+        poller._handle_comfy_ws(self._frame("progress", value=3, max=30, prompt_id="p1"))
+        poller._handle_comfy_ws(self._frame("execution_error", prompt_id="p1"))
+        assert state.comfy_progress is None
+        store.close()
+
+    async def test_progress_merged_into_raw_on_tick(self):
+        def handler(request):
+            if request.url.path == "/queue":
+                return httpx.Response(200, json=COMFY_QUEUE)
+            return httpx.Response(200, json=COMFY_SYS)
+
+        poller, state, store = self._poller(handler)
+        poller._handle_comfy_ws(self._frame("execution_start", prompt_id="p1"))
+        await asyncio.sleep(0)  # drain the spawned title-fetch task
+        poller._handle_comfy_ws(self._frame("progress", value=12, max=30, prompt_id="p1"))
+        assert await poller._tick_fast() is True
+        prog = state.raw["comfyui"]["progress"]
+        assert prog["step"] == 12
+        assert prog["total"] == 30
+        assert prog["elapsed_s"] >= 0
+        store.close()
+
+    async def test_resolve_node_titles(self):
+        def handler(request):
+            return httpx.Response(200, json={
+                "p1": {
+                    "prompt": [0, "client-1", {
+                        "4": {"class_type": "CheckpointLoaderSimple",
+                              "_meta": {"title": "Load Checkpoint"}},
+                        "9": {"class_type": "KSampler"},
+                    }],
+                }
+            })
+
+        poller, state, store = self._poller(handler)
+        await poller._resolve_comfy_titles("p1")
+        poller._handle_comfy_ws(self._frame("execution_start", prompt_id="other"))
+        await asyncio.sleep(0)  # drain the spawned title-fetch task
+        poller._handle_comfy_ws(self._frame("executing", node="9", prompt_id="p1"))
+        assert state.comfy_progress["node"] == "KSampler"
+        poller._handle_comfy_ws(self._frame("executing", node="4", prompt_id="p1"))
+        assert state.comfy_progress["node"] == "Load Checkpoint"
         store.close()
 
 

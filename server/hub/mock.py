@@ -116,6 +116,9 @@ class MockPoller:
                     "queue_pending": comfy["comfyui.queue_pending"],
                     "mem_gb": comfy["comfyui.model_mem_gb"],
                 }
+                progress = self._comfy_progress(comfy["comfyui.queue_running"] > 0)
+                if progress is not None:
+                    self.state.raw["comfyui"]["progress"] = progress
                 self.store.insert(self.device.id, now, "comfyui", comfy)
             await asyncio.sleep(self.cfg.poll_interval)
 
@@ -250,4 +253,29 @@ class MockPoller:
             "comfyui.queue_running": running,
             "comfyui.queue_pending": float(pending),
             "comfyui.model_mem_gb": self.comfy_mem.next(),
+        }
+
+    # one mock render = 30 steps over ~25 s of wall time, cycling through nodes
+    _COMFY_RUN_SECS = 25.0
+    _COMFY_STEPS = 30
+
+    def _comfy_progress(self, running: bool) -> dict | None:
+        """Simulated in-flight render for the UI, matching the shape the real
+        WS watcher writes: step/total climb per render cycle, nodes rotate."""
+        if not running:
+            self._comfy_run_start = None
+            return None
+        now = time.time()
+        start = getattr(self, "_comfy_run_start", None)
+        if start is None or now - start > self._COMFY_RUN_SECS:
+            self._comfy_run_start = start = now
+        elapsed = now - start
+        frac = elapsed / self._COMFY_RUN_SECS
+        nodes = ["Load Checkpoint", "KSampler", "VAE Decode"]
+        node = nodes[min(int(frac * 3), 2)] if frac < 0.5 else "KSampler"
+        return {
+            "step": min(self._COMFY_STEPS, max(1, round(frac * self._COMFY_STEPS))),
+            "total": self._COMFY_STEPS,
+            "node": node,
+            "elapsed_s": elapsed,
         }
