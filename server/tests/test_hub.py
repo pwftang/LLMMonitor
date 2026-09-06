@@ -603,6 +603,24 @@ class TestComfyRunProgress:
         assert poller._live_comfy_progress() is None
         store.close()
 
+    async def test_bootstraps_mid_run_frames(self):
+        # Watcher connected after the prompt already started, so no
+        # execution_start ever arrives — progress must still appear.
+        poller, state, store = self._poller()
+        assert state.comfy_progress is None
+        poller._handle_comfy_ws(self._frame("progress", value=11, max=30, prompt_id="p1"))
+        assert state.comfy_progress is not None
+        assert state.comfy_progress["step"] == 11
+        assert state.comfy_progress["total"] == 30
+        await asyncio.sleep(0)  # drain the spawned title-fetch task
+        poller._handle_comfy_ws(self._frame("executing", node="9", prompt_id="p1"))
+        assert state.comfy_progress["node"] == "9"
+        time.sleep(0.01)
+        assert poller._live_comfy_progress()["elapsed_s"] > 0
+        poller._handle_comfy_ws(self._frame("executing", node=None, prompt_id="p1"))
+        assert state.comfy_progress is None
+        store.close()
+
     def test_binary_and_garbage_frames_ignored(self):
         poller, state, store = self._poller()
         poller._handle_comfy_ws(b"\x89PNG\r\n jpeg preview bytes")
@@ -634,6 +652,37 @@ class TestComfyRunProgress:
         assert prog["step"] == 12
         assert prog["total"] == 30
         assert prog["elapsed_s"] >= 0
+        store.close()
+
+    async def test_elapsed_fallback_without_ws_frames(self):
+        # Opaque custom nodes (MiniMaxH3) emit no WS progress frames: REST
+        # queue_running is the only signal, so progress is duration-only.
+        def handler(request):
+            if request.url.path == "/queue":
+                return httpx.Response(200, json=COMFY_QUEUE)
+            return httpx.Response(200, json=COMFY_SYS)
+
+        poller, state, store = self._poller(handler)
+        assert await poller._tick_fast() is True
+        prog = state.raw["comfyui"]["progress"]
+        assert prog["step"] is None
+        assert prog["total"] is None
+        assert prog["node"] is None
+        assert prog["elapsed_s"] >= 0
+        assert poller._live_comfy_progress()["elapsed_s"] >= 0
+
+        # Queue drain clears the fallback clock and the progress key.
+        def idle_handler(request):
+            if request.url.path == "/queue":
+                return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+            return httpx.Response(200, json=COMFY_SYS)
+
+        poller._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(idle_handler), base_url="",
+        )
+        assert await poller._tick_fast() is True
+        assert "progress" not in state.raw["comfyui"]
+        assert poller._live_comfy_progress() is None
         store.close()
 
     async def test_resolve_node_titles(self):

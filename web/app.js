@@ -25,6 +25,19 @@ const ago = (ts) => {
   return `${Math.round(s / 3600)}h ago`;
 };
 const val = (obj, key) => (obj && obj[key] != null ? obj[key] : null);
+const fmtRunDur = (s) => {
+  if (s == null) return null;
+  if (s < 90) return `${Math.floor(s)}s`;
+  if (s < 5400) return `${Math.floor(s / 60)}m${String(Math.floor(s % 60)).padStart(2, "0")}s`;
+  return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+};
+const comfyProgressLabel = (p) => {
+  const bits = [p.total > 0 ? `step ${p.step}/${p.total} (${Math.round((p.step / p.total) * 100)}%)` : "rendering"];
+  if (p.node) bits.push(p.node);
+  const dur = fmtRunDur(p.elapsed_s);
+  if (dur) bits.push(dur);
+  return bits.join(" · ");
+};
 // macmon can die while omlx keeps the device "online"; flag it so the
 // (frozen) sys.* numbers aren't mistaken for live data.
 function macmonWarn(el, d) {
@@ -115,11 +128,8 @@ const COMFY_GROUP = ["comfyui", "layers", [
   }],
   ["run", (s, llm, d) => {
     const p = comfyOf(d)?.progress;
-    if (!p || !p.total) return "—";
-    const bits = [`step ${p.step}/${p.total}`];
-    if (p.node) bits.push(p.node);
-    if (p.elapsed_s != null) bits.push(`${p.elapsed_s.toFixed(0)}s`);
-    return bits.join(" · ");
+    if (!p || (!p.total && p.elapsed_s == null)) return "—";
+    return comfyProgressLabel(p);
   }],
   ["model memory", (s, llm, d) => {
     const c = comfyOf(d);
@@ -491,14 +501,17 @@ async function renderOverview() {
       }
       if (comfyProgEl) {
         const p = c && c.progress;
-        const on = p && p.total > 0;
+        // Determinate when the WS watcher has step counts; elapsed-only for
+        // long opaque nodes (e.g. MiniMaxH3) that emit no progress frames.
+        const on = p && (p.total > 0 || p.elapsed_s != null);
         comfyProgEl.hidden = !on;
         if (on) {
-          const bits = [`step ${p.step}/${p.total} (${Math.round((p.step / p.total) * 100)}%)`];
-          if (p.node) bits.push(p.node);
-          if (p.elapsed_s != null) bits.push(`${p.elapsed_s.toFixed(0)}s`);
-          cEls.prog.textContent = bits.join(" · ");
-          comfyBarFillEl.style.width = `${((p.step / p.total) * 100).toFixed(1)}%`;
+          cEls.prog.textContent = comfyProgressLabel(p);
+          if (p.total > 0) {
+            comfyBarFillEl.style.width = `${((p.step / p.total) * 100).toFixed(1)}%`;
+          } else {
+            comfyBarFillEl.style.width = "0%";
+          }
         }
       }
 

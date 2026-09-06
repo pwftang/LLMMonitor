@@ -251,6 +251,9 @@ class DevicePoller:
         # "executing" node ids ("12") become graph titles ("KSampler").
         self._comfy_node_titles: dict[str, str] = {}
         self._comfy_titles_prompt_id: str | None = None
+        # Wallclock the REST queue first reported a running job — the fallback
+        # progress clock for jobs whose nodes never emit WS progress frames.
+        self._comfy_run_since: float | None = None
 
     async def run(self) -> None:
         log.info("poller started for %s", self.device.id)
@@ -385,12 +388,18 @@ class DevicePoller:
                 log.warning("%s comfyui unreachable: %s", self.device.id, e)
             self.state.comfy_ok = False
             self.state.comfy_progress = None
+            self._comfy_run_since = None
             self.state.raw.pop("comfyui", None)
             return False
         if was_ok is False:
             log.info("%s comfyui recovered", self.device.id)
         self.state.comfy_ok = True
         series = extract_comfyui(queue, stats)
+        if series["comfyui.queue_running"] > 0:
+            if self._comfy_run_since is None:
+                self._comfy_run_since = time.time()
+        else:
+            self._comfy_run_since = None
         devices = stats.get("devices") or [{}]
         self.state.raw["comfyui"] = {
             "version": (stats.get("system") or {}).get("comfyui_version"),
@@ -408,9 +417,19 @@ class DevicePoller:
     def _live_comfy_progress(self) -> dict[str, Any] | None:
         """comfy_progress snapshot with elapsed_s computed at merge time."""
         p = self.state.comfy_progress
-        if p is None:
-            return None
-        return {**p, "elapsed_s": max(0.0, time.time() - p["started_at"])}
+        if p is not None:
+            return {**p, "elapsed_s": max(0.0, time.time() - p["started_at"])}
+        if self._comfy_run_since is not None:
+            # Custom-node jobs (MiniMaxH3 video, API-backed nodes) can run for
+            # many minutes without a single WS progress/executing frame, so
+            # fall back to what REST knows: a job is running, duration only.
+            return {
+                "step": None,
+                "total": None,
+                "node": None,
+                "elapsed_s": max(0.0, time.time() - self._comfy_run_since),
+            }
+        return None
 
     async def _comfy_ws_loop(self) -> None:
         """Watch ComfyUI's /ws feed for live run progress (step counts, node).
@@ -462,16 +481,33 @@ class DevicePoller:
             node = data.get("node")
             if node is None:
                 state.comfy_progress = None  # current prompt finished
-            elif state.comfy_progress is not None:
-                state.comfy_progress["node"] = self._comfy_node_titles.get(node, node)
+            else:
+                p = self._ensure_comfy_progress(data)
+                p["node"] = self._comfy_node_titles.get(node, node)
         elif typ == "progress":
-            if state.comfy_progress is not None:
-                v, m = data.get("value"), data.get("max")
-                if isinstance(v, (int, float)) and isinstance(m, (int, float)):
-                    state.comfy_progress["step"] = int(v)
-                    state.comfy_progress["total"] = int(m)
+            p = self._ensure_comfy_progress(data)
+            v, m = data.get("value"), data.get("max")
+            if isinstance(v, (int, float)) and isinstance(m, (int, float)):
+                p["step"] = int(v)
+                p["total"] = int(m)
         elif typ in ("execution_error", "execution_interrupted"):
             state.comfy_progress = None
+
+    def _ensure_comfy_progress(self, data: dict) -> dict:
+        """Live progress dict, bootstrapped when we connected mid-run and so
+        missed execution_start. elapsed_s counts from the first frame seen."""
+        p = self.state.comfy_progress
+        if p is None:
+            p = self.state.comfy_progress = {
+                "step": 0,
+                "total": 0,
+                "node": None,
+                "started_at": time.time(),
+            }
+        pid = data.get("prompt_id")
+        if isinstance(pid, str) and pid != self._comfy_titles_prompt_id:
+            asyncio.get_running_loop().create_task(self._resolve_comfy_titles(pid))
+        return p
 
     async def _resolve_comfy_titles(self, prompt_id: str) -> None:
         """Fetch the prompt graph once per run to map node ids → titles."""

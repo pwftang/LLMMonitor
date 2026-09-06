@@ -269,7 +269,12 @@ class MockPoller:
         start = getattr(self, "_comfy_run_start", None)
         if start is None or now - start > self._COMFY_RUN_SECS:
             self._comfy_run_start = start = now
+            self._comfy_cycle = getattr(self, "_comfy_cycle", 0) + 1
         elapsed = now - start
+        if self._comfy_cycle % 2 == 0:
+            # every second render acts like an opaque custom node (MiniMaxH3):
+            # no WS step frames, so the REST fallback shows duration only
+            return {"step": None, "total": None, "node": None, "elapsed_s": elapsed}
         frac = elapsed / self._COMFY_RUN_SECS
         nodes = ["Load Checkpoint", "KSampler", "VAE Decode"]
         node = nodes[min(int(frac * 3), 2)] if frac < 0.5 else "KSampler"
