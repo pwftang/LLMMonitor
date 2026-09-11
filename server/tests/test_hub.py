@@ -94,6 +94,7 @@ DISKMON_PAYLOAD = {
     "total_bytes": 2 * 1024**4,
     "used_bytes": 1024**4,
     "free_bytes": 1024**4,
+    "mem_available_pct": 30,  # kern.memorystatus_level → 70% pressure
 }
 
 
@@ -147,6 +148,7 @@ class TestExtractDisk:
         assert m["sys.disk_used_gb"] == pytest.approx(1024)
         assert m["sys.disk_free_gb"] == pytest.approx(1024)
         assert m["sys.disk_used_pct"] == pytest.approx(0.5)
+        assert m["sys.mem_pressure_pct"] == pytest.approx(0.7)
 
     def test_free_only_derives_used(self):
         m = extract_disk({"total_bytes": 100 * 1024**3, "free_bytes": 25 * 1024**3})
@@ -169,6 +171,18 @@ class TestExtractDisk:
     def test_used_pct_clamped(self):
         m = extract_disk({"total_bytes": 1024**3, "used_bytes": 2 * 1024**3})
         assert m["sys.disk_used_pct"] == 1.0
+
+    def test_old_agent_has_no_pressure_series(self):
+        # The initial diskmon installer predates mem_available_pct —
+        # the chip must simply stay hidden for those agents.
+        m = extract_disk({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
+        assert "sys.mem_pressure_pct" not in m
+
+    def test_mem_pressure_clamped(self):
+        up = extract_disk({"total_bytes": 1024**3, "mem_available_pct": -5})
+        assert up["sys.mem_pressure_pct"] == 1.0
+        down = extract_disk({"total_bytes": 1024**3, "mem_available_pct": 105})
+        assert down["sys.mem_pressure_pct"] == 0.0
 
 
 class TestExtractComfyui:
@@ -555,6 +569,7 @@ class TestPoller:
         assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
         assert state.system["sys.disk_free_gb"] == pytest.approx(1024.0)
         assert state.system["sys.disk_total_gb"] == pytest.approx(2048.0)
+        assert state.system["sys.mem_pressure_pct"] == pytest.approx(0.7)
         assert state.raw["diskmon"] == DISKMON_PAYLOAD
         assert state.public()["disk_ok"] is True
         assert state.public()["has_diskmon"] is True

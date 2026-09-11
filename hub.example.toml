@@ -26,7 +26,8 @@ rollup_seconds = 300        # rollup bucket size
 # macmon_port — macmon serve port (default 9090); set 0 to disable macmon
 # comfyui_port — ComfyUI port (opt-in; omit or set 0 to disable)
 # disk_port — diskmon agent port (opt-in; omit or set 0 to disable). diskmon is
-#             the tiny disk-usage agent installed by macos/install-diskmon-agent.sh
+#             the tiny disk-usage + memory-pressure agent installed by
+#             macos/install-diskmon-agent.sh
 # api_key   — omlx API key (omit if the server has no key configured)
 
 [[devices]]

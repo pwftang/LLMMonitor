@@ -2,7 +2,8 @@
 
 Metric namespaces written to the store:
   sys.*   — macmon system metrics (kind="system"); diskmon contributes
-            sys.disk_* into the same namespace (opt-in per device)
+            sys.disk_* and sys.mem_pressure_pct into the same namespace
+            (opt-in per device)
   llm.*   — omlx /admin/api/stats (kind="llm")
   llm.model.<slug>.* — per-model series from /admin/api/models (kind="models")
   comfyui.* — ComfyUI /queue + /system_stats (kind="comfyui"; opt-in per device)
@@ -114,11 +115,12 @@ def extract_omlx_stats(p: dict) -> dict[str, float]:
 
 
 def extract_disk(p: dict) -> dict[str, float]:
-    """diskmon /json payload → sys.disk_* series.
+    """diskmon /json payload → sys.disk_* + sys.mem_pressure_pct series.
 
     Payload is {"timestamp", "path", "total_bytes", "used_bytes",
-    "free_bytes"}; all keys are emitted by the agent, but treat each as
-    optional so a partial payload degrades gracefully.
+    "free_bytes", ["mem_available_pct"]}; all keys are emitted by the
+    agent, but treat each as optional so a partial payload degrades
+    gracefully.
     """
     out: dict[str, float] = {}
     total = p.get("total_bytes")
@@ -137,6 +139,12 @@ def extract_disk(p: dict) -> dict[str, float]:
         out["sys.disk_free_gb"] = _gb(total - used)
     if "sys.disk_used_gb" in out:
         out["sys.disk_used_pct"] = max(0.0, min(1.0, out["sys.disk_used_gb"] / out["sys.disk_total_gb"]))
+    # kern.memorystatus_level is the % of memory still AVAILABLE; invert for
+    # pressure. Only emitted by agents newer than the initial installer —
+    # older agents just keep the absence (chip stays hidden).
+    avail = p.get("mem_available_pct")
+    if isinstance(avail, (int, float)):
+        out["sys.mem_pressure_pct"] = max(0.0, min(1.0, (100.0 - float(avail)) / 100.0))
     return out
 
 

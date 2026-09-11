@@ -112,6 +112,7 @@ const LIVE_GROUPS = [
   ["memory", "memory", [
     ["model memory", (s, llm) => fmtGB(val(llm, "llm.model_mem_gb"))],
     ["ram", (s, llm, d) => (d.system ? `${fmtGB(val(s, "sys.ram_used_gb"))} / ${fmtGB(val(s, "sys.ram_total_gb"))}` : "—")],
+    ["pressure", (s) => fmtPct(val(s, "sys.mem_pressure_pct"))],
   ]],
   ["system", "cpu", [
     ["cpu / gpu", (s) => `${fmtPct(val(s, "sys.cpu_util"))} / ${fmtPct(val(s, "sys.gpu_util"))}`],
@@ -341,6 +342,7 @@ async function renderOverview() {
           : ""}
         <span class="macmon-warn" hidden>macmon unreachable</span>
         <span class="disk-chip" hidden></span>
+        <span class="mem-chip" hidden></span>
         <span class="card-state"></span>
       </div>
       <div class="card-body">
@@ -410,6 +412,7 @@ async function renderOverview() {
     const ipEl = card.querySelector(".card-ips");
     const macmonWarnEl = card.querySelector(".macmon-warn");
     const diskEl = card.querySelector(".disk-chip");
+    const memEl = card.querySelector(".mem-chip");
     const modelsEl = card.querySelector(".models-zone");
     const iEls = {};
     for (const el of card.querySelectorAll(".i-val[data-i]")) iEls[el.dataset.i] = el;
@@ -450,6 +453,14 @@ async function renderOverview() {
         diskEl.className = `disk-chip${pct > 92 ? " crit" : pct > 80 ? " warn" : ""}`;
         diskEl.title = `${val(s, "sys.disk_used_gb").toFixed(0)} GB used of ${val(s, "sys.disk_total_gb").toFixed(0)} GB`;
         diskEl.innerHTML = `${icon("database")}<span>${fmtDiskSize(dFree)} free</span>`;
+      }
+      const mPct = val(s, "sys.mem_pressure_pct");
+      memEl.hidden = mPct == null;
+      if (mPct != null) {
+        const pct = mPct * 100;
+        memEl.className = `mem-chip${pct > 92 ? " crit" : pct > 80 ? " warn" : ""}`;
+        memEl.title = `${pct.toFixed(0)}% memory pressure (macOS memorystatus level)`;
+        memEl.innerHTML = `${icon("memory")}<span>${pct.toFixed(0)}% mem</span>`;
       }
       verEl.textContent = fresh.omlx_version ? `omlx ${fresh.omlx_version}` : "";
       const ipBits = [];

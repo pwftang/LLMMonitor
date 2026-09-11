@@ -3,7 +3,8 @@
 #
 # diskmon is a tiny stdlib-only Python agent that answers GET /json with
 # {"timestamp","path","total_bytes","used_bytes","free_bytes"} for the root
-# volume. This installer is self-contained: it writes the agent to
+# volume, plus "mem_available_pct" (kern.memorystatus_level) when the sysctl
+# is readable. This installer is self-contained: it writes the agent to
 # ~/Library/diskmon/diskmon.py, then bootstraps a LaunchAgent that waits up to
 # 5 minutes for Tailscale to assign a 100.* address before starting it
 # (reboot-safe), with KeepAlive restarting it if it ever exits. Re-running is
@@ -22,23 +23,41 @@ pkill -f "diskmon.py" 2>/dev/null && echo "killed running diskmon instance" || t
 mkdir -p "$AGENT_DIR"
 cat > "$AGENT_PY" <<'EOF'
 #!/usr/bin/env python3
-"""diskmon - tiny disk-usage agent for LLMMonitor. Stdlib only."""
+"""diskmon - tiny disk + memory-pressure agent for LLMMonitor. Stdlib only."""
 import argparse
 import json
 import shutil
+import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def disk_payload(path: str) -> dict:
+# macOS reports pressure inversely: kern.memorystatus_level is the % of
+# memory still available (what `memory_pressure -Q` prints as the
+# "system-wide memory free percentage").
+def memory_level_pct():
+    try:
+        out = subprocess.check_output(
+            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_level"], timeout=2
+        )
+        return float(out.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None  # not macOS / sysctl failed → omit the key
+
+
+def agent_payload(path: str) -> dict:
     usage = shutil.disk_usage(path)
-    return {
+    payload = {
         "timestamp": time.time(),
         "path": path,
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
     }
+    level = memory_level_pct()
+    if level is not None:
+        payload["mem_available_pct"] = level
+    return payload
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/", "/json"):
             self.send_error(404)
             return
-        body = json.dumps(disk_payload(self.watch_path)).encode()
+        body = json.dumps(agent_payload(self.watch_path)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
