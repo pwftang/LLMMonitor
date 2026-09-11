@@ -26,6 +26,27 @@ const ago = (ts) => {
   return `${Math.round(s / 3600)}h ago`;
 };
 const val = (obj, key) => (obj && obj[key] != null ? obj[key] : null);
+const cssColor = (name, fallback) =>
+  getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+
+// Activity Monitor-style colour per point from a pressure series (0-1):
+// green <80%, amber 80-92%, red >92% — the same thresholds as the chips.
+// Points before the first pressure sample get null (series' own colour);
+// afterwards the colour carries forward across sampling gaps. Returns null
+// when there is no pressure data at all, so the chart keeps its normal look.
+function pressureSegColors(data, pressureData) {
+  if (!pressureData.length) return null;
+  const green = cssColor("--green", "#22c55e");
+  const amber = cssColor("--amber", "#f59e0b");
+  const red = cssColor("--red", "#ef4444");
+  let pi = 0, last = null;
+  return data.map(([t]) => {
+    while (pi + 1 < pressureData.length && pressureData[pi + 1][0] <= t) pi++;
+    const [pt, pv] = pressureData[pi];
+    if (pt <= t) last = pv * 100 > 92 ? red : pv * 100 > 80 ? amber : green;
+    return last;
+  });
+}
 const fmtRunDur = (s) => {
   if (s == null) return null;
   if (s < 90) return `${Math.floor(s)}s`;
@@ -554,7 +575,7 @@ async function renderOverview() {
     updateCard(d);
 
     const sparkDefs = [
-      { cid: `spark-ram-${d.id}`, metric: "sys.ram_used_pct", mul: 100, colorVar: "--chart-2", ymax: 100 },
+      { cid: `spark-ram-${d.id}`, metric: "sys.ram_used_pct", mul: 100, colorVar: "--chart-2", ymax: 100, pressure: true },
       { cid: `spark-cpu-${d.id}`, metric: "sys.cpu_util", mul: 100, colorVar: "--chart-4", ymax: 100 },
       { cid: `spark-gpu-${d.id}`, metric: "sys.gpu_util", mul: 100, colorVar: "--chart-5", ymax: 100 },
     ];
@@ -570,20 +591,27 @@ async function renderOverview() {
         ymax: def.ymax,
       });
       liveCharts.push(chart);
-      cardSparks.push([def.metric, def.mul, def.colorVar || null, chart]);
+      cardSparks.push([def, chart]);
     }
     sparks.push([d.id, cardSparks]);
   }
 
-  // sparkline data: 1h of cpu/gpu/ram usage, refreshed every 30s
-  const SPARK_METRICS = ["sys.cpu_util", "sys.gpu_util", "sys.ram_used_pct"];
+  // sparkline data: 1h of cpu/gpu/ram usage (plus memory pressure for the
+  // ram chart's Activity-Monitor-style colouring), refreshed every 30s
+  const SPARK_METRICS = ["sys.cpu_util", "sys.gpu_util", "sys.ram_used_pct", "sys.mem_pressure_pct"];
   const refreshSparks = async () => {
     for (const [id, cardSparks] of sparks) {
       try {
         const h = await api(`/api/devices/${id}/history?metrics=${SPARK_METRICS.join(",")}&range=1h`);
-        for (const [metric, mul, colorVar, chart] of cardSparks) {
-          const data = (h.series[metric] || []).map(([t, v]) => [t, v * mul]);
-          chart.setSeries([{ label: metric, data, colorVar }]);
+        const pressure = h.series["sys.mem_pressure_pct"] || [];
+        for (const [def, chart] of cardSparks) {
+          const data = (h.series[def.metric] || []).map(([t, v]) => [t, v * def.mul]);
+          const series = { label: def.metric, data, colorVar: def.colorVar || null };
+          if (def.pressure) {
+            const seg = pressureSegColors(data, pressure);
+            if (seg) series.colors = seg;
+          }
+          chart.setSeries([series]);
         }
       } catch { /* device may be offline */ }
     }
@@ -626,7 +654,7 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "GPU usage", metrics: ["sys.gpu_util"], labels: ["gpu"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "CPU temperature", metrics: ["sys.cpu_temp_c"], labels: ["cpu"], macmon: true, fmt: (v) => `${v.toFixed(1)}°C` },
     { title: "GPU temperature", metrics: ["sys.gpu_temp_c"], labels: ["gpu"], macmon: true, fmt: (v) => `${v.toFixed(1)}°C` },
-    { title: "RAM utilisation", metrics: ["sys.ram_used_pct"], labels: ["ram"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%` },
+    { title: "RAM utilisation", metrics: ["sys.ram_used_pct"], labels: ["ram"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
     { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb"], labels: ["ram used", "models"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Token throughput", metrics: ["llm.prefill_tps", "llm.gen_tps"], labels: ["prefill", "generation"], omlx: true, fmt: (v) => `${v.toFixed(1)} t/s` },
     { title: "KV cache", metrics: ["llm.cached_tokens"], labels: ["cached tokens"], omlx: true, fmt: fmtAxisTokens },
@@ -799,6 +827,7 @@ async function renderDetail(id, initialRange = "1h") {
     const wanted = new Set();
     for (const p of panels) {
       p.metrics.forEach((m) => wanted.add(m));
+      if (p.pressureSeries) wanted.add(p.pressureSeries);
       if (p.dynamic === "models") modelMetrics.forEach(([m]) => wanted.add(m));
     }
     const all = [...wanted];
@@ -824,6 +853,10 @@ async function renderDetail(id, initialRange = "1h") {
         for (const [m, label] of modelMetrics) {
           list.push({ label, data: series[m] || [] });
         }
+      }
+      if (p.pressureSeries && list.length) {
+        const seg = pressureSegColors(list[0].data, series[p.pressureSeries] || []);
+        if (seg) list[0].colors = seg;
       }
       ctx.charts[p.title].setSeries(list);
       const statsEl = ctx.statsEls[p.title];

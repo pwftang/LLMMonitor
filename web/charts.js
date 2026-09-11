@@ -58,11 +58,15 @@ export class Chart {
   }
 
   setSeries(series) {
-    // series: [{label, data:[[ts,v],...], color?, band?}] — series without an
-    // explicit colour resolve from the theme palette at draw time, so a
-    // theme toggle recolours them without re-setting data. band is an
+    // series: [{label, data:[[ts,v],...], color?, band?, colors?}] — series
+    // without an explicit colour resolve from the theme palette at draw time,
+    // so a theme toggle recolours them without re-setting data. band is an
     // optional {min: [[ts,v],...], max: [[ts,v],...]} pair drawn as a
-    // shaded envelope behind the line (rollup min/max).
+    // shaded envelope behind the line (rollup min/max). colors is an optional
+    // per-point array of CSS colours (null entries fall back to the series
+    // colour): when present the line is stroked segment-by-segment and the
+    // area fill uses the latest segment colour — used for Activity-Monitor-
+    // style pressure colouring on the memory charts.
     this.series = series.map((s, i) => ({ _ci: i, ...s }));
     this.draw();
   }
@@ -153,6 +157,14 @@ export class Chart {
     for (const s of this.series) {
       if (s.data.length === 0) continue;
       const color = this._color(s);
+      // pressure-coloured series tint their fill with the latest segment colour
+      let segTint = null;
+      if (s.colors) {
+        for (let i = s.colors.length - 1; i >= 0; i--) {
+          if (s.colors[i]) { segTint = s.colors[i]; break; }
+        }
+      }
+      const fillColor = segTint || color;
       const hasBand = s.band && s.band.min.length && s.band.max.length;
       if (hasBand) {
         // rollup min/max envelope, drawn as a polygon: max forward, min back
@@ -174,28 +186,39 @@ export class Chart {
         ctx.lineTo(x(s.data[s.data.length - 1][0]), y(this.opts.ymin));
         ctx.closePath();
         if (this.opts.fill === "gradient") {
-          const [r, g, bl] = hexRGB(color);
+          const [r, g, bl] = hexRGB(fillColor);
           const grad = ctx.createLinearGradient(0, L.y0, 0, L.y1);
           grad.addColorStop(0, `rgba(${r},${g},${bl},0.3)`);
           grad.addColorStop(1, `rgba(${r},${g},${bl},0)`);
           ctx.fillStyle = grad;
         } else {
           ctx.globalAlpha = 0.08;
-          ctx.fillStyle = color;
+          ctx.fillStyle = fillColor;
         }
         ctx.fill();
         ctx.globalAlpha = 1;
       }
-      ctx.beginPath();
-      ctx.strokeStyle = color;
       ctx.lineWidth = 1.4;
       ctx.lineJoin = "round";
-      for (let i = 0; i < s.data.length; i++) {
-        const [t, v] = s.data[i];
-        if (i === 0) ctx.moveTo(x(t), y(v));
-        else ctx.lineTo(x(t), y(v));
+      if (s.colors) {
+        // per-segment stroke so the trace colour follows each point
+        for (let i = 1; i < s.data.length; i++) {
+          ctx.beginPath();
+          ctx.strokeStyle = s.colors[i - 1] || color;
+          ctx.moveTo(x(s.data[i - 1][0]), y(s.data[i - 1][1]));
+          ctx.lineTo(x(s.data[i][0]), y(s.data[i][1]));
+          ctx.stroke();
+        }
+      } else {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        for (let i = 0; i < s.data.length; i++) {
+          const [t, v] = s.data[i];
+          if (i === 0) ctx.moveTo(x(t), y(v));
+          else ctx.lineTo(x(t), y(v));
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
     }
 
     if (this.opts.frame) {
