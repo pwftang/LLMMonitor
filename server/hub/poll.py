@@ -1,7 +1,7 @@
 """Poll one device: macmon /json + omlx admin API + ComfyUI → metrics + latest state.
 
 Metric namespaces written to the store:
-  sys.*   — macmon system metrics (kind="system"); diskmon contributes
+  sys.*   — macmon system metrics (kind="system"); hostmon contributes
             sys.disk_* and sys.mem_pressure_pct into the same namespace
             (opt-in per device)
   llm.*   — omlx /admin/api/stats (kind="llm")
@@ -114,8 +114,8 @@ def extract_omlx_stats(p: dict) -> dict[str, float]:
     return out
 
 
-def extract_disk(p: dict) -> dict[str, float]:
-    """diskmon /json payload → sys.disk_* + sys.mem_pressure_pct series.
+def extract_hostmon(p: dict) -> dict[str, float]:
+    """hostmon /json payload → sys.disk_* + sys.mem_pressure_pct series.
 
     Payload is {"timestamp", "path", "total_bytes", "used_bytes",
     "free_bytes", ["mem_available_pct"]}; all keys are emitted by the
@@ -230,7 +230,7 @@ class DeviceState:
         self.macmon_ok: bool | None = None
         self.macmon_last_ok: float | None = None
         self.comfy_ok: bool | None = None
-        self.disk_ok: bool | None = None
+        self.host_ok: bool | None = None
         # Live render progress pushed by the ComfyUI /ws watch loop:
         # {"step", "total", "node", "started_at", "elapsed_s"} while running.
         self.comfy_progress: dict[str, Any] | None = None
@@ -256,8 +256,8 @@ class DeviceState:
             "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
             "has_comfyui": self.device.comfyui_base is not None,
-            "has_diskmon": self.device.diskmon_url is not None,
-            "disk_ok": self.disk_ok,
+            "has_hostmon": self.device.hostmon_url is not None,
+            "host_ok": self.host_ok,
             "comfy_ok": self.comfy_ok,
             "omlx_admin_url": f"{base}/admin" if base else None,
             "tailscale_ip": self.tailscale_ip,
@@ -375,15 +375,15 @@ class DevicePoller:
             ok |= await self._tick_omlx_stats()
         if self.device.comfyui_base:
             ok |= await self._tick_comfyui()
-        if self.device.diskmon_url:
-            ok |= await self._tick_diskmon()
+        if self.device.hostmon_url:
+            ok |= await self._tick_hostmon()
         if ok:
             self.state.mark_ok()
         else:
             self.state.mark_offline("unreachable")
-            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s diskmon=%s)",
+            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s hostmon=%s)",
                         self.device.id, self.device.macmon_url, self.device.omlx_base,
-                        self.device.comfyui_base, self.device.diskmon_url)
+                        self.device.comfyui_base, self.device.hostmon_url)
         return ok
 
     async def _tick_macmon(self) -> bool:
@@ -412,28 +412,28 @@ class DevicePoller:
         self.store.insert(self.device.id, time.time(), "system", series)
         return True
 
-    async def _tick_diskmon(self) -> bool:
-        assert self._client is not None and self.device.diskmon_url is not None
-        was_ok = self.state.disk_ok
+    async def _tick_hostmon(self) -> bool:
+        assert self._client is not None and self.device.hostmon_url is not None
+        was_ok = self.state.host_ok
         try:
-            r = await self._client.get(self.device.diskmon_url)
+            r = await self._client.get(self.device.hostmon_url)
             r.raise_for_status()
             payload = r.json()
             if not isinstance(payload, dict):
-                raise ValueError("diskmon /json returned non-object payload")
+                raise ValueError("hostmon /json returned non-object payload")
         except Exception as e:  # noqa: BLE001
             if was_ok is not False:
-                log.warning("%s diskmon unreachable: %s", self.device.id, e)
-            self.state.disk_ok = False
+                log.warning("%s hostmon unreachable: %s", self.device.id, e)
+            self.state.host_ok = False
             return False
         if was_ok is False:
-            log.info("%s diskmon recovered", self.device.id)
-        self.state.disk_ok = True
-        series = extract_disk(payload)
+            log.info("%s hostmon recovered", self.device.id)
+        self.state.host_ok = True
+        series = extract_hostmon(payload)
         # Merge, don't assign: macmon owns state.system and replaces it
-        # wholesale every tick; diskmon only contributes the sys.disk_* keys.
+        # wholesale every tick; hostmon only contributes its sys.* keys.
         self.state.system.update(series)
-        self.state.raw["diskmon"] = payload
+        self.state.raw["hostmon"] = payload
         self.store.insert(self.device.id, time.time(), "system", series)
         return True
 

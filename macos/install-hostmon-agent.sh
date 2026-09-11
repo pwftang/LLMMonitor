@@ -1,29 +1,39 @@
 #!/bin/bash
-# Install/refresh the diskmon LaunchAgent on a Mac.
+# Install/refresh the hostmon LaunchAgent on a Mac.
 #
-# diskmon is a tiny stdlib-only Python agent that answers GET /json with
+# hostmon is a tiny stdlib-only Python agent that answers GET /json with
+# host telemetry that macmon doesn't cover: currently
 # {"timestamp","path","total_bytes","used_bytes","free_bytes"} for the root
 # volume, plus "mem_available_pct" (kern.memorystatus_level) when the sysctl
 # is readable. This installer is self-contained: it writes the agent to
-# ~/Library/diskmon/diskmon.py, then bootstraps a LaunchAgent that waits up to
+# ~/Library/hostmon/hostmon.py, then bootstraps a LaunchAgent that waits up to
 # 5 minutes for Tailscale to assign a 100.* address before starting it
 # (reboot-safe), with KeepAlive restarting it if it ever exits. Re-running is
-# safe and also kills any strays first.
+# safe and also kills any strays first — including migrating/removing a
+# previous "diskmon" (com.diskmon, ~/Library/diskmon) install.
 #
 # Port: 9091 (next to macmon's 9090). Run once per Mac:
-#   bash install-diskmon-agent.sh
+#   bash install-hostmon-agent.sh
 set -euo pipefail
 
-AGENT_DIR="$HOME/Library/diskmon"
-AGENT_PY="$AGENT_DIR/diskmon.py"
-PLIST="$HOME/Library/LaunchAgents/com.diskmon.plist"
+AGENT_DIR="$HOME/Library/hostmon"
+AGENT_PY="$AGENT_DIR/hostmon.py"
+PLIST="$HOME/Library/LaunchAgents/com.hostmon.plist"
 
+# Migrate a previous diskmon install: stop it, drop its LaunchAgent and dir.
 pkill -f "diskmon.py" 2>/dev/null && echo "killed running diskmon instance" || true
+if launchctl bootout "gui/$(id -u)/com.diskmon" 2>/dev/null; then
+  echo "removed old com.diskmon LaunchAgent"
+fi
+rm -f "$HOME/Library/LaunchAgents/com.diskmon.plist"
+rm -rf "$HOME/Library/diskmon"
+
+pkill -f "hostmon.py" 2>/dev/null && echo "killed running hostmon instance" || true
 
 mkdir -p "$AGENT_DIR"
 cat > "$AGENT_PY" <<'EOF'
 #!/usr/bin/env python3
-"""diskmon - tiny disk + memory-pressure agent for LLMMonitor. Stdlib only."""
+"""hostmon - tiny host telemetry agent for LLMMonitor. Stdlib only."""
 import argparse
 import json
 import shutil
@@ -62,7 +72,7 @@ def agent_payload(path: str) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     watch_path = "/"
-    server_version = "diskmon/1.0"
+    server_version = "hostmon/1.1"
 
     def do_GET(self):
         if self.path not in ("/", "/json"):
@@ -80,7 +90,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="disk usage agent")
+    ap = argparse.ArgumentParser(description="host telemetry agent")
     ap.add_argument("--host", default="127.0.0.1", help="bind address")
     ap.add_argument("-p", "--port", type=int, default=9091)
     ap.add_argument("--path", default="/", help="filesystem to report on")
@@ -99,24 +109,24 @@ cat > "$PLIST" <<'EOF'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.diskmon</string>
+  <key>Label</key><string>com.hostmon</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string><string>-c</string>
-    <string>TS=$( (command -v tailscale; ls /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale 2>/dev/null; echo tailscaled-missing) | head -1 ); IP=""; for i in $(seq 1 150); do IP=$($TS ip -4 2>/dev/null | head -1); case "$IP" in 100.*) break;; esac; IP=""; sleep 2; done; [ -n "$IP" ] || { echo "diskmon: no tailnet IP after 300s; exiting for launchd retry"; exit 1; }; exec /usr/bin/env python3 "$HOME/Library/diskmon/diskmon.py" --host "$IP" -p 9091</string>
+    <string>TS=$( (command -v tailscale; ls /Applications/Tailscale.app/Contents/MacOS/Tailscale /opt/homebrew/bin/tailscale /usr/local/bin/tailscale 2>/dev/null; echo tailscaled-missing) | head -1 ); IP=""; for i in $(seq 1 150); do IP=$($TS ip -4 2>/dev/null | head -1); case "$IP" in 100.*) break;; esac; IP=""; sleep 2; done; [ -n "$IP" ] || { echo "hostmon: no tailnet IP after 300s; exiting for launchd retry"; exit 1; }; exec /usr/bin/env python3 "$HOME/Library/hostmon/hostmon.py" --host "$IP" -p 9091</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/tmp/diskmon.log</string>
-  <key>StandardErrorPath</key><string>/tmp/diskmon.log</string>
+  <key>StandardOutPath</key><string>/tmp/hostmon.log</string>
+  <key>StandardErrorPath</key><string>/tmp/hostmon.log</string>
 </dict>
 </plist>
 EOF
 
-launchctl bootout "gui/$(id -u)/com.diskmon" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.hostmon" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
 sleep 2
-tail -n 3 /tmp/diskmon.log || true
-echo "diskmon listening on this machine's tailnet IP, port 9091"
+tail -n 3 /tmp/hostmon.log || true
+echo "hostmon listening on this machine's tailnet IP, port 9091"

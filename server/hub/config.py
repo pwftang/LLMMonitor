@@ -19,9 +19,9 @@ class Device:
     macmon_port: int | None = 9090
     # ComfyUI is opt-in: most machines don't run it, so no port → no polling.
     comfyui_port: int | None = None
-    # diskmon (macos/install-diskmon-agent.sh) is likewise opt-in; absent → no
-    # disk series for the device and the UI hides the indicator.
-    disk_port: int | None = None
+    # hostmon (macos/install-hostmon-agent.sh) is likewise opt-in; absent → no
+    # host telemetry series for the device and the UI hides the indicators.
+    host_port: int | None = None
     api_key: str | None = None
     # Optional stable id; defaults to a slug of `name`. Set explicitly so a
     # display-name change doesn't orphan this device's stored history.
@@ -50,10 +50,10 @@ class Device:
         return f"http://{self.host}:{self.comfyui_port}"
 
     @property
-    def diskmon_url(self) -> str | None:
-        if not self.disk_port:
+    def hostmon_url(self) -> str | None:
+        if not self.host_port:
             return None
-        return f"http://{self.host}:{self.disk_port}/json"
+        return f"http://{self.host}:{self.host_port}/json"
 
 
 @dataclass
@@ -127,7 +127,9 @@ def load(path: str | os.PathLike | None = None) -> Config:
             macmon_port=d.get("macmon_port", 9090),
             # ComfyUI is different: omitted (or 0) → disabled; it's opt-in.
             comfyui_port=d.get("comfyui_port"),
-            disk_port=d.get("disk_port"),
+            # disk_port is the pre-rename alias; kept so existing hub.toml
+            # files keep working.
+            host_port=d.get("host_port", d.get("disk_port")),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )

@@ -15,7 +15,7 @@ from hub.poll import (
     DevicePoller,
     DeviceState,
     extract_comfyui,
-    extract_disk,
+    extract_hostmon,
     extract_model_series,
     extract_omlx_stats,
     extract_system,
@@ -87,8 +87,8 @@ COMFY_SYS = {
     ],
 }
 
-# diskmon /json (macos/install-diskmon-agent.sh, port 9091).
-DISKMON_PAYLOAD = {
+# hostmon /json (macos/install-hostmon-agent.sh, port 9091).
+HOSTMON_PAYLOAD = {
     "timestamp": 1757548800.0,
     "path": "/",
     "total_bytes": 2 * 1024**4,
@@ -141,9 +141,9 @@ class TestExtractOmlxStats:
         assert extract_omlx_stats({"avg_generation_tps": 3.2}) == {"llm.gen_tps": 3.2}
 
 
-class TestExtractDisk:
+class TestExtractHostmon:
     def test_full_payload(self):
-        m = extract_disk(DISKMON_PAYLOAD)
+        m = extract_hostmon(HOSTMON_PAYLOAD)
         assert m["sys.disk_total_gb"] == pytest.approx(2 * 1024)
         assert m["sys.disk_used_gb"] == pytest.approx(1024)
         assert m["sys.disk_free_gb"] == pytest.approx(1024)
@@ -151,37 +151,37 @@ class TestExtractDisk:
         assert m["sys.mem_pressure_pct"] == pytest.approx(0.7)
 
     def test_free_only_derives_used(self):
-        m = extract_disk({"total_bytes": 100 * 1024**3, "free_bytes": 25 * 1024**3})
+        m = extract_hostmon({"total_bytes": 100 * 1024**3, "free_bytes": 25 * 1024**3})
         assert m["sys.disk_total_gb"] == pytest.approx(100)
         assert m["sys.disk_free_gb"] == pytest.approx(25)
         assert m["sys.disk_used_gb"] == pytest.approx(75)
         assert m["sys.disk_used_pct"] == pytest.approx(0.75)
 
     def test_used_only_derives_free(self):
-        m = extract_disk({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
+        m = extract_hostmon({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
         assert m["sys.disk_used_gb"] == pytest.approx(30)
         assert m["sys.disk_free_gb"] == pytest.approx(70)
         assert m["sys.disk_used_pct"] == pytest.approx(0.3)
 
     def test_no_total_means_no_series(self):
         # without total_bytes there is no usable reference — emit nothing
-        assert extract_disk({}) == {}
-        assert extract_disk({"used_bytes": 5}) == {}
+        assert extract_hostmon({}) == {}
+        assert extract_hostmon({"used_bytes": 5}) == {}
 
     def test_used_pct_clamped(self):
-        m = extract_disk({"total_bytes": 1024**3, "used_bytes": 2 * 1024**3})
+        m = extract_hostmon({"total_bytes": 1024**3, "used_bytes": 2 * 1024**3})
         assert m["sys.disk_used_pct"] == 1.0
 
     def test_old_agent_has_no_pressure_series(self):
-        # The initial diskmon installer predates mem_available_pct —
+        # The initial hostmon installer predates mem_available_pct —
         # the chip must simply stay hidden for those agents.
-        m = extract_disk({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
+        m = extract_hostmon({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
         assert "sys.mem_pressure_pct" not in m
 
     def test_mem_pressure_clamped(self):
-        up = extract_disk({"total_bytes": 1024**3, "mem_available_pct": -5})
+        up = extract_hostmon({"total_bytes": 1024**3, "mem_available_pct": -5})
         assert up["sys.mem_pressure_pct"] == 1.0
-        down = extract_disk({"total_bytes": 1024**3, "mem_available_pct": 105})
+        down = extract_hostmon({"total_bytes": 1024**3, "mem_available_pct": 105})
         assert down["sys.mem_pressure_pct"] == 0.0
 
 
@@ -443,19 +443,31 @@ macmon_port = 9091
         assert comfy.comfyui_base == "http://b:8188"
         assert off.comfyui_port == 0 and off.comfyui_base is None
 
-    def test_disk_opt_in(self, tmp_path):
-        # Like ComfyUI, diskmon has no default port: omitted (or 0) must
+    def test_hostmon_opt_in(self, tmp_path):
+        # Like ComfyUI, hostmon has no default port: omitted (or 0) must
         # disable it, an explicit port enables it.
         (tmp_path / "hub.toml").write_text(
-            '[[devices]]\nname = "No Disk"\nhost = "a"\n'
-            '[[devices]]\nname = "Disk"\nhost = "b"\ndisk_port = 9091\n'
-            '[[devices]]\nname = "Off"\nhost = "c"\ndisk_port = 0\n'
+            '[[devices]]\nname = "No Host"\nhost = "a"\n'
+            '[[devices]]\nname = "Host"\nhost = "b"\nhost_port = 9091\n'
+            '[[devices]]\nname = "Off"\nhost = "c"\nhost_port = 0\n'
         )
         cfg = load(tmp_path / "hub.toml")
-        no_disk, disk, off = cfg.devices
-        assert no_disk.disk_port is None and no_disk.diskmon_url is None
-        assert disk.diskmon_url == "http://b:9091/json"
-        assert off.disk_port == 0 and off.diskmon_url is None
+        no_host, host, off = cfg.devices
+        assert no_host.host_port is None and no_host.hostmon_url is None
+        assert host.hostmon_url == "http://b:9091/json"
+        assert off.host_port == 0 and off.hostmon_url is None
+
+    def test_hostmon_legacy_disk_port_alias(self, tmp_path):
+        # Pre-rename configs used disk_port; it must keep working until
+        # users update their hub.toml.
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "Legacy"\nhost = "a"\ndisk_port = 9091\n'
+            '[[devices]]\nname = "Both"\nhost = "b"\nhost_port = 9092\ndisk_port = 9091\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        legacy, both = cfg.devices
+        assert legacy.host_port == 9091
+        assert both.host_port == 9092  # host_port wins over the alias
 
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
@@ -552,60 +564,60 @@ class TestPoller:
         assert state.public()["macmon_ok"] is True
         store.close()
 
-    async def test_diskmon_success_merges_into_system(self):
+    async def test_hostmon_success_merges_into_system(self):
         def handler(request):
-            # macmon and diskmon both serve /json — route by port.
+            # macmon and hostmon both serve /json — route by port.
             if request.url.port == 9091:
-                return httpx.Response(200, json=DISKMON_PAYLOAD)
+                return httpx.Response(200, json=HOSTMON_PAYLOAD)
             return httpx.Response(200, json=MACMON_PAYLOAD)
 
-        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, disk_port=9091)
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, host_port=9091)
         poller, state, store = self._poller(handler, dev)
-        assert state.disk_ok is None  # not polled yet → chip hidden
+        assert state.host_ok is None  # not polled yet → chips hidden
         assert await poller._tick_fast() is True
-        assert state.disk_ok is True
-        # macmon keys survive the merge (macmon assigns, diskmon updates)
+        assert state.host_ok is True
+        # macmon keys survive the merge (macmon assigns, hostmon updates)
         assert state.system["sys.cpu_temp_c"] == pytest.approx(43.73614)
         assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
         assert state.system["sys.disk_free_gb"] == pytest.approx(1024.0)
         assert state.system["sys.disk_total_gb"] == pytest.approx(2048.0)
         assert state.system["sys.mem_pressure_pct"] == pytest.approx(0.7)
-        assert state.raw["diskmon"] == DISKMON_PAYLOAD
-        assert state.public()["disk_ok"] is True
-        assert state.public()["has_diskmon"] is True
+        assert state.raw["hostmon"] == HOSTMON_PAYLOAD
+        assert state.public()["host_ok"] is True
+        assert state.public()["has_hostmon"] is True
         store.commit()
         h = store.history("t", ["sys.disk_used_pct"], time.time() - 10, time.time() + 1)
         assert h["sys.disk_used_pct"][-1][1] == pytest.approx(0.5)
         store.close()
 
-    async def test_diskmon_failure_tracked_per_source(self):
-        # diskmon down must not take the device offline — macmon still serves.
-        fail = {"disk": False}
+    async def test_hostmon_failure_tracked_per_source(self):
+        # hostmon down must not take the device offline — macmon still serves.
+        fail = {"host": False}
 
         def handler(request):
             if request.url.port == 9091:
-                if fail["disk"]:
+                if fail["host"]:
                     raise httpx.ConnectError("connection refused")
-                return httpx.Response(200, json=DISKMON_PAYLOAD)
+                return httpx.Response(200, json=HOSTMON_PAYLOAD)
             return httpx.Response(200, json=MACMON_PAYLOAD)
 
-        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, disk_port=9091)
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, host_port=9091)
         poller, state, store = self._poller(handler, dev)
-        assert state.disk_ok is None
+        assert state.host_ok is None
 
-        fail["disk"] = True
+        fail["host"] = True
         assert await poller._tick_fast() is True
         assert state.online  # device stays "online" via macmon
-        assert state.disk_ok is False
+        assert state.host_ok is False
         assert state.system["sys.cpu_temp_c"] == pytest.approx(43.73614)
         assert "sys.disk_used_pct" not in state.system
-        assert state.public()["disk_ok"] is False
+        assert state.public()["host_ok"] is False
 
-        fail["disk"] = False
+        fail["host"] = False
         assert await poller._tick_fast() is True
-        assert state.disk_ok is True
+        assert state.host_ok is True
         assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
-        assert state.public()["disk_ok"] is True
+        assert state.public()["host_ok"] is True
         store.close()
 
     async def test_models_tick_unwraps_payload_for_frontend(self):

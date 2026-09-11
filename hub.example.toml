@@ -25,9 +25,10 @@ rollup_seconds = 300        # rollup bucket size
 # omlx_port — omlx admin port (default 8000); set 0 to disable omlx for a machine
 # macmon_port — macmon serve port (default 9090); set 0 to disable macmon
 # comfyui_port — ComfyUI port (opt-in; omit or set 0 to disable)
-# disk_port — diskmon agent port (opt-in; omit or set 0 to disable). diskmon is
-#             the tiny disk-usage + memory-pressure agent installed by
-#             macos/install-diskmon-agent.sh
+# host_port — hostmon agent port (opt-in; omit or set 0 to disable). hostmon is
+#             the tiny host telemetry agent (disk usage, memory pressure, ...)
+#             installed by macos/install-hostmon-agent.sh. The old key
+#             disk_port is still accepted as an alias.
 # api_key   — omlx API key (omit if the server has no key configured)
 
 [[devices]]
@@ -36,7 +37,7 @@ host = "mac-studio-m2-ultra.tailc08855.ts.net"
 omlx_port = 8000
 macmon_port = 9090
 comfyui_port = 8188          # opt-in; omit or 0 to disable
-disk_port = 9091             # opt-in; diskmon agent (macos/install-diskmon-agent.sh)
+host_port = 9091             # opt-in; hostmon agent (macos/install-hostmon-agent.sh)
 api_key = "your-omlx-api-key-here"
 
 [[devices]]
