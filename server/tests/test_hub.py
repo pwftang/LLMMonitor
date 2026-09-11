@@ -129,6 +129,28 @@ class TestExtractOmlxStats:
     def test_partial_payload(self):
         assert extract_omlx_stats({"avg_generation_tps": 3.2}) == {"llm.gen_tps": 3.2}
 
+    def test_disk_nested(self):
+        # prospective omlx extension: "disk": {total|used|free}_bytes
+        m = extract_omlx_stats(
+            {"disk": {"total_bytes": 2 * 1024**4, "used_bytes": 1024**4}}
+        )
+        assert m["llm.disk_total_gb"] == pytest.approx(2 * 1024)
+        assert m["llm.disk_used_gb"] == pytest.approx(1024)
+        assert m["llm.disk_free_gb"] == pytest.approx(1024)
+        assert m["llm.disk_used_pct"] == pytest.approx(0.5)
+
+    def test_disk_flat_keys_and_free_only(self):
+        m = extract_omlx_stats({"disk_total_bytes": 100 * 1024**3, "disk_free_bytes": 25 * 1024**3})
+        assert m["llm.disk_total_gb"] == pytest.approx(100)
+        assert m["llm.disk_free_gb"] == pytest.approx(25)
+        assert m["llm.disk_used_gb"] == pytest.approx(75)
+        assert m["llm.disk_used_pct"] == pytest.approx(0.75)
+
+    def test_disk_absent(self):
+        # omlx builds predating the disk extension emit nothing; UI stays hidden
+        m = extract_omlx_stats({})
+        assert not any(k.startswith("llm.disk_") for k in m)
+
 
 class TestExtractComfyui:
     def test_full_payload(self):

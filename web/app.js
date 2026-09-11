@@ -5,6 +5,7 @@ const hubStatus = document.getElementById("hub-status");
 
 /* ---------- formatting ---------- */
 const fmtGB = (v) => (v == null ? "—" : `${v.toFixed(1)} GB`);
+const fmtDiskSize = (gb) => (gb >= 950 ? `${(gb / 1024).toFixed(1)} TB` : `${gb.toFixed(0)} GB`);
 const fmtPct = (v) => (v == null ? "—" : `${(v * 100).toFixed(0)}%`);
 const fmtPct100 = (v) => (v == null ? "—" : `${v.toFixed(0)}%`);
 const fmtTemp = (v) => (v == null ? "—" : `${v.toFixed(1)}°C`);
@@ -339,6 +340,7 @@ async function renderOverview() {
           ? `<a class="icon-btn card-admin" href="${esc(d.omlx_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx admin dashboard" aria-label="open omlx admin dashboard">${icon("ext")}</a>`
           : ""}
         <span class="macmon-warn" hidden>macmon unreachable</span>
+        <span class="disk-chip" hidden></span>
         <span class="card-state"></span>
       </div>
       <div class="card-body">
@@ -407,6 +409,7 @@ async function renderOverview() {
     const verEl = card.querySelector(".omlx-ver");
     const ipEl = card.querySelector(".card-ips");
     const macmonWarnEl = card.querySelector(".macmon-warn");
+    const diskEl = card.querySelector(".disk-chip");
     const modelsEl = card.querySelector(".models-zone");
     const iEls = {};
     for (const el of card.querySelectorAll(".i-val[data-i]")) iEls[el.dataset.i] = el;
@@ -438,6 +441,16 @@ async function renderOverview() {
       stateEl.textContent = state[1];
       stateEl.className = `card-state st-${state[0] || "idle"}`;
       card.classList.toggle("sys-stale", macmonWarn(macmonWarnEl, fresh));
+      const dPct = val(llm, "llm.disk_used_pct");
+      const dFree = val(llm, "llm.disk_free_gb");
+      const diskOn = dPct != null && dFree != null;
+      diskEl.hidden = !diskOn;
+      if (diskOn) {
+        const pct = dPct * 100;
+        diskEl.className = `disk-chip${pct > 92 ? " crit" : pct > 80 ? " warn" : ""}`;
+        diskEl.title = `${val(llm, "llm.disk_used_gb").toFixed(0)} GB used of ${val(llm, "llm.disk_total_gb").toFixed(0)} GB`;
+        diskEl.innerHTML = `${icon("database")}<span>${fmtDiskSize(dFree)} free</span>`;
+      }
       verEl.textContent = fresh.omlx_version ? `omlx ${fresh.omlx_version}` : "";
       const ipBits = [];
       if (fresh.tailscale_ip) ipBits.push(`<span class="cip"><b>ts</b>&hairsp;${esc(fresh.tailscale_ip)}</span>`);

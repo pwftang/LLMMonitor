@@ -108,6 +108,30 @@ def extract_omlx_stats(p: dict) -> dict[str, float]:
         out["llm.model_mem_gb"] = _gb(mem)
     add("llm.active_reqs", p.get("total_active_requests"))
     add("llm.waiting_reqs", p.get("total_waiting_requests"))
+
+    # Disk usage for the omlx cache volume. Expected omlx /admin/api/stats
+    # extension (not yet shipped): a "disk" object with byte values, e.g.
+    #   "disk": {"total_bytes": ..., "used_bytes": ..., "free_bytes": ...}
+    # Flat top-level keys are accepted as a fallback. Everything is optional;
+    # when omlx predates the extension no disk series are emitted and the UI
+    # hides the indicator.
+    disk = p.get("disk")
+    src: dict = disk if isinstance(disk, dict) else p
+    total = _first_key(src, ("total_bytes", "disk_total_bytes", "total"))
+    free = _first_key(src, ("free_bytes", "disk_free_bytes", "free"))
+    used = _first_key(src, ("used_bytes", "disk_used_bytes", "used"))
+    if isinstance(total, (int, float)) and total:
+        out["llm.disk_total_gb"] = _gb(total)
+        if isinstance(used, (int, float)):
+            out["llm.disk_used_gb"] = _gb(used)
+        elif isinstance(free, (int, float)):
+            out["llm.disk_used_gb"] = _gb(total - free)
+        if isinstance(free, (int, float)):
+            out["llm.disk_free_gb"] = _gb(free)
+        elif isinstance(used, (int, float)):
+            out["llm.disk_free_gb"] = _gb(total - used)
+        if "llm.disk_used_gb" in out:
+            out["llm.disk_used_pct"] = max(0.0, min(1.0, out["llm.disk_used_gb"] / out["llm.disk_total_gb"]))
     return out
 
 
