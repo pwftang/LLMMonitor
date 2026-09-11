@@ -115,12 +115,15 @@ def extract_omlx_stats(p: dict) -> dict[str, float]:
 
 
 def extract_hostmon(p: dict) -> dict[str, float]:
-    """hostmon /json payload → sys.disk_* + sys.mem_pressure_pct series.
+    """hostmon /json payload → sys.disk_* + sys.mem_pressure_pct + sys.net_*
+    series.
 
     Payload is {"timestamp", "path", "total_bytes", "used_bytes",
-    "free_bytes", ["mem_available_pct"]}; all keys are emitted by the
-    agent, but treat each as optional so a partial payload degrades
-    gracefully.
+    "free_bytes", ["mem_available_pct"], ["uptime_s"],
+    ["net_rx_Bps", "net_tx_Bps"], ["top_rss_procs"]}; all keys are emitted
+    by the agent, but treat each as optional so a partial payload degrades
+    gracefully. uptime_s/top_rss_procs are point-in-time values surfaced
+    via state.raw rather than series; the net rates are time series.
     """
     out: dict[str, float] = {}
     total = p.get("total_bytes")
@@ -145,6 +148,12 @@ def extract_hostmon(p: dict) -> dict[str, float]:
     avail = p.get("mem_available_pct")
     if isinstance(avail, (int, float)):
         out["sys.mem_pressure_pct"] = max(0.0, min(1.0, (100.0 - float(avail)) / 100.0))
+    # Byte/s rates, absent on the agent's first sample after (re)start.
+    rx = p.get("net_rx_Bps")
+    tx = p.get("net_tx_Bps")
+    if isinstance(rx, (int, float)) and isinstance(tx, (int, float)):
+        out["sys.net_rx_Bps"] = max(0.0, float(rx))
+        out["sys.net_tx_Bps"] = max(0.0, float(tx))
     return out
 
 

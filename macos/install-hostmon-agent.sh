@@ -4,8 +4,12 @@
 # hostmon is a tiny stdlib-only Python agent that answers GET /json with
 # host telemetry that macmon doesn't cover: currently
 # {"timestamp","path","total_bytes","used_bytes","free_bytes"} for the root
-# volume, plus "mem_available_pct" (kern.memorystatus_level) when the sysctl
-# is readable. This installer is self-contained: it writes the agent to
+# volume, plus "mem_available_pct" (kern.memorystatus_level), "uptime_s"
+# (kern.boottime), "net_rx_Bps"/"net_tx_Bps" (network throughput from
+# cumulative netstat counters; rate across polls, so absent on the first
+# request) and "top_rss_procs" ([[name, MB]] top-5 process memory, from ps)
+# — each when the underlying sysctl/command is readable. This installer is
+# self-contained: it writes the agent to
 # ~/Library/hostmon/hostmon.py, then bootstraps a LaunchAgent that waits up to
 # 5 minutes for Tailscale to assign a 100.* address before starting it
 # (reboot-safe), with KeepAlive restarting it if it ever exits. Re-running is
@@ -36,23 +40,93 @@ cat > "$AGENT_PY" <<'EOF'
 """hostmon - tiny host telemetry agent for LLMMonitor. Stdlib only."""
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def _run(cmd: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(cmd, timeout=2, stderr=subprocess.DEVNULL).decode()
+    except (OSError, subprocess.SubprocessError):
+        return None  # command missing / failed → omit the key
+
+
 # macOS reports pressure inversely: kern.memorystatus_level is the % of
 # memory still available (what `memory_pressure -Q` prints as the
 # "system-wide memory free percentage").
 def memory_level_pct():
+    out = _run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_level"])
+    if out is None:
+        return None
     try:
-        out = subprocess.check_output(
-            ["/usr/sbin/sysctl", "-n", "kern.memorystatus_level"], timeout=2
-        )
         return float(out.strip())
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None  # not macOS / sysctl failed → omit the key
+    except ValueError:
+        return None
+
+
+# kern.boottime prints "{ sec = 1747…, usec = … } <date>"; uptime = now - sec.
+def uptime_s():
+    out = _run(["/usr/sbin/sysctl", "-n", "kern.boottime"])
+    if out is None:
+        return None
+    m = re.search(r"sec\s*=\s*(\d+)", out)
+    return round(time.time() - int(m.group(1))) if m else None
+
+
+_net_last = None  # (t, rx_bytes, tx_bytes) cumulative across interfaces
+
+
+def net_rates_bps():
+    """(rx_Bps, tx_Bps) summed over non-loopback interfaces, from the delta
+    between this and the previous `netstat -ibn` sample. First call returns
+    (None, None): a single cumulative snapshot has no rate."""
+    global _net_last
+    out = _run(["/usr/sbin/netstat", "-ibn"])
+    if out is None:
+        return None, None
+    rx = tx = 0
+    for line in out.splitlines():
+        c = line.split()
+        # Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Obytes Coll —
+        # link# Address rows carry the per-interface cumulative counters.
+        if len(c) >= 10 and c[3].startswith("link#") and c[0] != "lo0":
+            try:
+                rx += int(c[6])
+                tx += int(c[9])
+            except ValueError:
+                continue
+    now = time.time()
+    rates = (None, None)
+    if _net_last is not None and now > _net_last[0]:
+        drx, dtx = rx - _net_last[1], tx - _net_last[2]
+        if drx >= 0 and dtx >= 0:  # counters reset when an interface bounces
+            rates = (round(drx / (now - _net_last[0]), 1), round(dtx / (now - _net_last[0]), 1))
+    _net_last = (now, rx, tx)
+    return rates
+
+
+def top_rss_procs(n: int = 5):
+    """Top-n memory consumers as [[name, MB], ...], totals aggregated by
+    command name so app + helper processes count together."""
+    out = _run(["/bin/ps", "-A", "-o", "rss=", "-o", "comm="])
+    if out is None:
+        return None
+    totals = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            kb = int(parts[0])
+        except ValueError:
+            continue
+        name = parts[1].rsplit("/", 1)[-1]
+        totals[name] = totals.get(name, 0) + kb
+    return [[name, round(kb / 1024, 1)] for name, kb in
+            sorted(totals.items(), key=lambda kv: -kv[1])[:n]]
 
 
 def agent_payload(path: str) -> dict:
@@ -64,15 +138,23 @@ def agent_payload(path: str) -> dict:
         "used_bytes": usage.used,
         "free_bytes": usage.free,
     }
-    level = memory_level_pct()
-    if level is not None:
-        payload["mem_available_pct"] = level
+    for key, val in (
+        ("mem_available_pct", memory_level_pct()),
+        ("uptime_s", uptime_s()),
+        ("top_rss_procs", top_rss_procs()),
+    ):
+        if val is not None:
+            payload[key] = val
+    rx, tx = net_rates_bps()
+    if rx is not None:
+        payload["net_rx_Bps"] = rx
+        payload["net_tx_Bps"] = tx
     return payload
 
 
 class Handler(BaseHTTPRequestHandler):
     watch_path = "/"
-    server_version = "hostmon/1.1"
+    server_version = "hostmon/1.2"
 
     def do_GET(self):
         if self.path not in ("/", "/json"):

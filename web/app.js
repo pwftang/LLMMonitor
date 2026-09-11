@@ -8,6 +8,20 @@ const fmtGB = (v) => (v == null ? "—" : `${v.toFixed(1)} GB`);
 const fmtDiskSize = (gb) => (gb >= 950 ? `${(gb / 1024).toFixed(1)} TB` : `${gb.toFixed(0)} GB`);
 const fmtPct = (v) => (v == null ? "—" : `${(v * 100).toFixed(0)}%`);
 const fmtPct100 = (v) => (v == null ? "—" : `${v.toFixed(0)}%`);
+const fmtBps = (v) => (v == null ? "—"
+  : v >= 1e9 ? `${(v / 1e9).toFixed(2)} GB/s`
+  : v >= 1e6 ? `${(v / 1e6).toFixed(1)} MB/s`
+  : v >= 1e3 ? `${(v / 1e3).toFixed(0)} kB/s`
+  : `${v.toFixed(0)} B/s`);
+const fmtMB = (mb) => (mb == null ? "—" : mb >= 1024 ? fmtGB(mb / 1024) : `${mb.toFixed(0)} MB`);
+const fmtUptime = (s) => {
+  if (s == null) return "—";
+  s = Math.max(0, Math.round(s));
+  const dd = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (dd) return `${dd}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+};
 const fmtTemp = (v) => (v == null ? "—" : `${v.toFixed(1)}°C`);
 const fmtTps = (v) => (v == null ? "—" : `${v.toFixed(1)} t/s`);
 const tokParts = (v) =>
@@ -159,6 +173,7 @@ const LIVE_GROUPS = [
   ["system", "cpu", [
     ["cpu / gpu", (s) => `${fmtPct(val(s, "sys.cpu_util"))} / ${fmtPct(val(s, "sys.gpu_util"))}`],
     ["temps", (s) => `${fmtTemp(val(s, "sys.cpu_temp_c"))} / ${fmtTemp(val(s, "sys.gpu_temp_c"))}`],
+    ["uptime", (s, llm, d) => fmtUptime(d.raw?.hostmon?.uptime_s)],
     ["last seen", (s, llm, d) => (d.online ? "now" : ago(d.last_seen))],
   ]],
 ];
@@ -299,6 +314,18 @@ function hwLineHTML(s, llm) {
   return wait != null && wait > 0 ? `${num0(wait)} queued` : "";
 }
 
+// hostmon's top_rss_procs is [[name, MB], …] aggregated per command name.
+function topProcsHTML(procs) {
+  if (!Array.isArray(procs) || !procs.length)
+    return `<div class="rows"><div class="m-none">no process data</div></div>`;
+  return `<div class="rows">${procs
+    .map(([name, mb]) => `<div class="row">
+      <div class="m-main"><span class="m-name">${esc(name)}</span></div>
+      <div class="m-right"><span class="m-size">${fmtMB(mb)}</span></div>
+    </div>`)
+    .join("")}</div>`;
+}
+
 // ComfyUI is opt-in per device; when unreachable the poller drops raw.comfyui
 // entirely (like stale macmon), so "no payload + comfy_ok false" = down.
 const comfyOf = (d) => (d && d.raw && d.raw.comfyui ? d.raw.comfyui : null);
@@ -313,6 +340,7 @@ const ICONS = {
   database: '<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M4.5 5.5v13c0 1.55 3.36 2.8 7.5 2.8s7.5-1.25 7.5-2.8v-13M4.5 12c0 1.55 3.36 2.8 7.5 2.8s7.5-1.25 7.5-2.8" fill="none" stroke="currentColor" stroke-width="1.7"/>',
   box: '<path d="M12 2.5 21 7.5v9l-9 5-9-5v-9l9-5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M12 12 21 7.5M12 12 3 7.5m9 4.5V21.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
   layers: '<rect x="3" y="7" width="13" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M7 7V5a1.5 1.5 0 0 1 1.5-1.5H18A2.5 2.5 0 0 1 20.5 6v9.5a1.5 1.5 0 0 1-1.5 1.5h-2" fill="none" stroke="currentColor" stroke-width="1.7"/>',
+  globe: '<circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3.5 12h17M12 3.5c-5.4 5.7-5.4 11.3 0 17M12 3.5c5.4 5.7 5.4 11.3 0 17" fill="none" stroke="currentColor" stroke-width="1.5"/>',
   fan: '<circle cx="12" cy="12" r="1.8" fill="currentColor"/><path d="M12 10c-1-2 .5-4.5.5-4.5C16 5.5 17 9 13 10m2 1.5c2.2-.5 4.5 1.5 4.5 1.5-1 3.5-4.7 3.1-6 .5m-3.5-.5c-1.2 2-4.6 2-4.6 2 0-3.6 3.3-4.9 5.3-3.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
   sun: '<circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>',
   moon: '<path d="M20 14.5A8.5 8.5 0 0 1 9.5 4 8.5 8.5 0 1 0 20 14.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
@@ -330,6 +358,7 @@ function panelIcon(title) {
   if (t.includes("utilisation") || t.includes("usage")) return icon("cpu");
   if (t.includes("memory") || t.includes("kv cache")) return icon("memory");
   if (t.includes("throughput")) return icon("activity");
+  if (t.includes("network")) return icon("globe");
   if (t.includes("requests")) return icon("layers");
   if (t.includes("cache")) return icon("database");
   if (t.includes("fan")) return icon("fan");
@@ -667,6 +696,7 @@ async function renderDetail(id, initialRange = "1h") {
   let range = initialRange;
   let lastModelsHTML = "";
   let lastAvailHTML = "";
+  let lastProcsHTML = "";
   const gen = routeGen;
   disposeCharts();
   view.innerHTML = `<div class="empty">loading…</div>`;
@@ -682,6 +712,7 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "Memory pressure", metrics: ["sys.mem_pressure_pct"], labels: ["pressure"], pct: true, hostmon: true, ymax: 100, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb", "sys.swap_used_gb"], labels: ["ram used", "models", "swap"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Disk usage", metrics: ["sys.disk_used_pct"], labels: ["full"], pct: true, hostmon: true, ymax: 100, projection: true, fmt: (v) => `${v.toFixed(0)}%` },
+    { title: "Network", metrics: ["sys.net_rx_Bps", "sys.net_tx_Bps"], labels: ["download", "upload"], hostmon: true, fmt: fmtBps },
     { title: "Token throughput", metrics: ["llm.prefill_tps", "llm.gen_tps"], labels: ["prefill", "generation"], omlx: true, fmt: (v) => `${v.toFixed(1)} t/s` },
     { title: "KV cache", metrics: ["llm.cached_tokens"], labels: ["cached tokens"], omlx: true, fmt: fmtAxisTokens },
     { title: "Cache efficiency", metrics: ["llm.cache_eff"], labels: ["hit rate"], omlx: true, fmt: (v) => `${v.toFixed(0)}%` },
@@ -720,7 +751,11 @@ async function renderDetail(id, initialRange = "1h") {
       <div class="panel wide" style="margin-top:14px">
         <div class="panel-head">${icon("database")}<span class="kicker">Available models</span></div>
         <div class="panel-body" id="avail-models"></div>
-      </div>`;
+      </div>
+      ${d.has_hostmon ? `<div class="panel wide" style="margin-top:14px">
+        <div class="panel-head">${icon("activity")}<span class="kicker">Top processes by memory</span></div>
+        <div class="panel-body" id="top-procs"></div>
+      </div>` : ""}`;
     view.innerHTML = head;
     view.querySelector("#big").innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
     const liveGroups = [...LIVE_GROUPS];
@@ -837,6 +872,15 @@ async function renderDetail(id, initialRange = "1h") {
         if (html !== lastAvailHTML) {
           lastAvailHTML = html;
           avail.innerHTML = html;
+        }
+      }
+
+      const procs = view.querySelector("#top-procs");
+      if (procs) {
+        const html = topProcsHTML(d.raw?.hostmon?.top_rss_procs);
+        if (html !== lastProcsHTML) {
+          lastProcsHTML = html;
+          procs.innerHTML = html;
         }
       }
     } catch {

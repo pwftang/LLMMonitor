@@ -95,6 +95,11 @@ HOSTMON_PAYLOAD = {
     "used_bytes": 1024**4,
     "free_bytes": 1024**4,
     "mem_available_pct": 30,  # kern.memorystatus_level → 70% pressure
+    # hostmon/1.2 additions:
+    "uptime_s": 90125,
+    "net_rx_Bps": 2.5e6,
+    "net_tx_Bps": 1.25e6,
+    "top_rss_procs": [["omlx", 18342.4], ["WindowServer", 938.1]],
 }
 
 
@@ -149,6 +154,14 @@ class TestExtractHostmon:
         assert m["sys.disk_free_gb"] == pytest.approx(1024)
         assert m["sys.disk_used_pct"] == pytest.approx(0.5)
         assert m["sys.mem_pressure_pct"] == pytest.approx(0.7)
+        assert m["sys.net_rx_Bps"] == pytest.approx(2.5e6)
+        assert m["sys.net_tx_Bps"] == pytest.approx(1.25e6)
+
+    def test_point_in_time_keys_stay_raw_only(self):
+        # uptime_s / top_rss_procs are not time series — the UI reads them
+        # from state.raw["hostmon"], so extract_hostmon must not chart them.
+        m = extract_hostmon(HOSTMON_PAYLOAD)
+        assert not any("uptime" in k or "proc" in k for k in m)
 
     def test_free_only_derives_used(self):
         m = extract_hostmon({"total_bytes": 100 * 1024**3, "free_bytes": 25 * 1024**3})
@@ -183,6 +196,18 @@ class TestExtractHostmon:
         assert up["sys.mem_pressure_pct"] == 1.0
         down = extract_hostmon({"total_bytes": 1024**3, "mem_available_pct": 105})
         assert down["sys.mem_pressure_pct"] == 0.0
+
+    def test_net_rates_optional(self):
+        # The agent omits both net keys until it has two samples to diff
+        # (first request after boot) — and pre-1.2 agents never emit them.
+        m = extract_hostmon({"total_bytes": 1024**3})
+        assert "sys.net_rx_Bps" not in m
+        assert "sys.net_tx_Bps" not in m
+
+    def test_net_rates_clamped(self):
+        m = extract_hostmon({"total_bytes": 1024**3, "net_rx_Bps": -3, "net_tx_Bps": -1})
+        assert m["sys.net_rx_Bps"] == 0.0
+        assert m["sys.net_tx_Bps"] == 0.0
 
 
 class TestExtractComfyui:
