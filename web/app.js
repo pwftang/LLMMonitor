@@ -336,12 +336,15 @@ async function renderOverview() {
         <div class="card-title">
           <h2>${esc(d.name)} <span class="omlx-ver"></span></h2>
           <div class="card-ips"></div>
+          <div class="disk-line" hidden>
+            <div class="mbar disk-bar"><div class="mbar-fill disk-fill"></div></div>
+            <span class="disk-text"></span>
+          </div>
         </div>
         ${d.omlx_admin_url
           ? `<a class="icon-btn card-admin" href="${esc(d.omlx_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx admin dashboard" aria-label="open omlx admin dashboard">${icon("ext")}</a>`
           : ""}
         <span class="macmon-warn" hidden>macmon unreachable</span>
-        <span class="disk-chip" hidden></span>
         <span class="mem-chip" hidden></span>
         <span class="card-state"></span>
       </div>
@@ -411,7 +414,9 @@ async function renderOverview() {
     const verEl = card.querySelector(".omlx-ver");
     const ipEl = card.querySelector(".card-ips");
     const macmonWarnEl = card.querySelector(".macmon-warn");
-    const diskEl = card.querySelector(".disk-chip");
+    const diskLineEl = card.querySelector(".disk-line");
+    const diskFillEl = card.querySelector(".disk-fill");
+    const diskTextEl = card.querySelector(".disk-text");
     const memEl = card.querySelector(".mem-chip");
     const modelsEl = card.querySelector(".models-zone");
     const iEls = {};
@@ -447,12 +452,15 @@ async function renderOverview() {
       const dPct = val(s, "sys.disk_used_pct");
       const dFree = val(s, "sys.disk_free_gb");
       const diskOn = dPct != null && dFree != null;
-      diskEl.hidden = !diskOn;
+      diskLineEl.hidden = !diskOn;
       if (diskOn) {
         const pct = dPct * 100;
-        diskEl.className = `disk-chip${pct > 92 ? " crit" : pct > 80 ? " warn" : ""}`;
-        diskEl.title = `${val(s, "sys.disk_used_gb").toFixed(0)} GB used of ${val(s, "sys.disk_total_gb").toFixed(0)} GB`;
-        diskEl.innerHTML = `${icon("database")}<span>${fmtDiskSize(dFree)} free</span>`;
+        const cls = pct > 92 ? " crit" : pct > 80 ? " warn" : "";
+        diskFillEl.className = `mbar-fill disk-fill${cls}`;
+        diskFillEl.style.width = `${pct.toFixed(1)}%`;
+        diskTextEl.className = `disk-text${cls}`;
+        diskTextEl.textContent = `${pct.toFixed(0)}% full · ${fmtDiskSize(dFree)} free`;
+        diskLineEl.title = `${val(s, "sys.disk_used_gb").toFixed(0)} GB used of ${val(s, "sys.disk_total_gb").toFixed(0)} GB`;
       }
       const mPct = val(s, "sys.mem_pressure_pct");
       memEl.hidden = mPct == null;

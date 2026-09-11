@@ -319,7 +319,6 @@ a { color: var(--blue); text-decoration: none; }
   white-space: nowrap;
   flex-shrink: 0;
 }
-.disk-chip,
 .mem-chip {
   display: inline-flex;
   align-items: center;
@@ -330,12 +329,30 @@ a { color: var(--blue); text-decoration: none; }
   white-space: nowrap;
   flex-shrink: 0;
 }
-.disk-chip svg,
 .mem-chip svg { width: 12px; height: 12px; }
-.disk-chip.warn,
 .mem-chip.warn { color: var(--amber); }
-.disk-chip.crit,
 .mem-chip.crit { color: var(--red); }
+
+.disk-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+.disk-line[hidden] { display: none; }
+.disk-bar {
+  flex: 1;
+  max-width: 120px;
+  height: 3px;
+}
+.disk-text {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.disk-text.warn { color: var(--amber); }
+.disk-text.crit { color: var(--red); }
 .card.sys-stale .sec-sys,
 .card.sys-stale .sec-pwr { opacity: 0.45; }
 .omlx-ver { font-size: 10px; font-weight: 400; color: var(--text-3); letter-spacing: 0.2px; }
