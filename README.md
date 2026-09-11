@@ -5,6 +5,11 @@ One-page monitoring for a small fleet of Apple Silicon Macs serving LLMs with
 click-through drill-down: loaded models, per-model and total model memory,
 token throughput, KV cache stats — plus macmon-style CPU/GPU/RAM, temperature,
 fan and power metrics, with history (24 h full-resolution, 30 d rolled up).
+The drill-down also covers memory pressure (RAM charts are coloured by it),
+swap, clock speeds, a CPU/GPU/RAM/ANE power breakdown and disk usage with a
+"full in ~N days" projection. A tiny companion agent, hostmon, adds what
+macmon can't: disk free/used, the macOS memory-pressure level, uptime,
+network throughput and the top memory-hungry processes.
 
 ## How it works
 
@@ -12,15 +17,17 @@ fan and power metrics, with history (24 h full-resolution, 30 d rolled up).
 ┌──────────────┐   polls every 2–5 s over Tailscale    ┌──────────────────────┐
 │  hub (this)  │ ────────────────────────────────────▶ │ Mac: omlx :8000      │
 │  FastAPI +   │   GET /admin/api/stats, /models        │      macmon :9090    │
-│  SQLite + JS │   GET http://<mac>:9090/json           │      ComfyUI :8188 * │
-└──────────────┘   GET http://<mac>:8188/queue, /system_stats (opt-in per device)
+│  SQLite + JS │   GET http://<mac>:9090/json           │      hostmon :9091   │
+└──────────────┘   GET http://<mac>:9091/json           │      ComfyUI :8188 * │
+                   GET http://<mac>:8188/queue, /system_stats (opt-in per device)
 ```
 
 \* ComfyUI polling is opt-in per device (`comfyui_port` in `hub.toml`).
 
-The Macs run **nothing new except `macmon serve`** (Rust, no sudo, negligible
-footprint). The hub is a single Python process with one SQLite file, so moving
-it to a VM/container later is a copy of the repo + data dir.
+The Macs run `macmon serve` (Rust, no sudo, negligible footprint) plus
+`hostmon`, a stdlib-only Python agent from this repo. The hub is a single
+Python process with one SQLite file, so moving it to a VM/container later is
+a copy of the repo + data dir.
 
 ## Set up each Mac (once)
 
@@ -51,6 +58,18 @@ launchctl list | grep macmon          # column 1 = PID means running
 curl -s http://$(tailscale ip -4 | head -1):9090/json | head -c 200
 ```
 
+Then install hostmon, which reports what macmon doesn't (disk space, memory
+pressure, uptime, network throughput, top processes by memory):
+
+```sh
+./macos/install-hostmon-agent.sh
+```
+
+Same recipe as macmon — `~/Library/LaunchAgents/com.hostmon.plist`, waits for
+the tailnet IP, `KeepAlive` restarts it. Verify:
+`curl -s http://$(tailscale ip -4 | head -1):9091/json`. If you skip hostmon
+the dashboard just hides its panels; nothing errors.
+
 omlx needs nothing further — just note its admin port and API key. Note that
 the MacBook will go to sleep; the hub marks it offline and backfills when it
 returns (that's expected, not an error). Don't bother enabling omlx auth for
@@ -71,10 +90,10 @@ bind the tailnet IP — never `0.0.0.0`, especially on the MacBook.) Then add
 `comfyui_port = 8188` to that device's block in `hub.toml`. Nothing new runs on
 the Mac — the hub just polls the REST API ComfyUI already serves.
 
-> **Trust boundary:** the omlx admin port is key-protected by you; macmon and
-> this hub are unauthenticated read-only endpoints. All three rely on the
-> tailnet as the boundary — lock a Tailscale ACL to your own devices if you
-> want belt and braces.
+> **Trust boundary:** the omlx admin port is key-protected by you; macmon,
+> hostmon and this hub are unauthenticated read-only endpoints. All rely on
+> the tailnet as the boundary — lock a Tailscale ACL to your own devices if
+> you want belt and braces.
 
 ## Run the hub
 
