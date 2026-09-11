@@ -47,6 +47,27 @@ function pressureSegColors(data, pressureData) {
     return last;
   });
 }
+
+// Extrapolate a %-full series (linear least-squares) to a "disk full in
+// ~N d" estimate for the disk panel's head label — "not growing" when the
+// slope is flat/negative (the common case), "" without enough points.
+function diskFullText(data) {
+  const n = data.length;
+  if (n < 3) return "";
+  let sx = 0, sy = 0;
+  for (const [t, v] of data) { sx += t; sy += v; }
+  const mx = sx / n, my = sy / n;
+  let num = 0, den = 0;
+  for (const [t, v] of data) { num += (t - mx) * (v - my); den += (t - mx) * (t - mx); }
+  if (den === 0) return "";
+  const slope = num / den; // %-points per second
+  if (slope <= 0) return "not growing";
+  const days = (100 - data[n - 1][1]) / (slope * 86400);
+  if (days >= 365) return `full in ~${(days / 365).toFixed(1)} yr`;
+  if (days >= 2) return `full in ~${Math.round(days)} d`;
+  if (days > 0) return `full in ~${Math.max(1, Math.round(days * 24))} h`;
+  return "nearly full";
+}
 const fmtRunDur = (s) => {
   if (s == null) return null;
   if (s < 90) return `${Math.floor(s)}s`;
@@ -304,6 +325,8 @@ function panelIcon(title) {
   if (t.includes("power")) return icon("zap");
   if (t.includes("temperature")) return icon("thermometer");
   if (t.includes("ram")) return icon("memory");
+  if (t.includes("disk")) return icon("database");
+  if (t.includes("clock")) return icon("cpu");
   if (t.includes("utilisation") || t.includes("usage")) return icon("cpu");
   if (t.includes("memory") || t.includes("kv cache")) return icon("memory");
   if (t.includes("throughput")) return icon("activity");
@@ -649,13 +672,16 @@ async function renderDetail(id, initialRange = "1h") {
   view.innerHTML = `<div class="empty">loading…</div>`;
 
   const panels = [
-    { title: "Power", metrics: ["sys.sys_power_w", "sys.cpu_power_w", "sys.gpu_power_w"], labels: ["system", "cpu", "gpu"], macmon: true, fmt: (v) => `${v.toFixed(1)} W` },
+    { title: "Power", metrics: ["sys.sys_power_w", "sys.cpu_power_w", "sys.gpu_power_w", "sys.ram_power_w", "sys.ane_power_w"], labels: ["system", "cpu", "gpu", "ram", "ane"], macmon: true, fmt: (v) => `${v.toFixed(1)} W` },
     { title: "CPU usage", metrics: ["sys.cpu_util"], labels: ["cpu"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "GPU usage", metrics: ["sys.gpu_util"], labels: ["gpu"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "CPU temperature", metrics: ["sys.cpu_temp_c"], labels: ["cpu"], macmon: true, fmt: (v) => `${v.toFixed(1)}°C` },
     { title: "GPU temperature", metrics: ["sys.gpu_temp_c"], labels: ["gpu"], macmon: true, fmt: (v) => `${v.toFixed(1)}°C` },
+    { title: "Clock speeds", metrics: ["sys.ecpu_freq_mhz", "sys.pcpu_freq_mhz", "sys.gpu_freq_mhz"], labels: ["e-cores", "p-cores", "gpu"], macmon: true, fmt: (v) => `${v.toFixed(0)} MHz` },
     { title: "RAM utilisation", metrics: ["sys.ram_used_pct"], labels: ["ram"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
-    { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb"], labels: ["ram used", "models"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
+    { title: "Memory pressure", metrics: ["sys.mem_pressure_pct"], labels: ["pressure"], pct: true, hostmon: true, ymax: 100, fmt: (v) => `${v.toFixed(0)}%` },
+    { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb", "sys.swap_used_gb"], labels: ["ram used", "models", "swap"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
+    { title: "Disk usage", metrics: ["sys.disk_used_pct"], labels: ["full"], pct: true, hostmon: true, ymax: 100, projection: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "Token throughput", metrics: ["llm.prefill_tps", "llm.gen_tps"], labels: ["prefill", "generation"], omlx: true, fmt: (v) => `${v.toFixed(1)} t/s` },
     { title: "KV cache", metrics: ["llm.cached_tokens"], labels: ["cached tokens"], omlx: true, fmt: fmtAxisTokens },
     { title: "Cache efficiency", metrics: ["llm.cache_eff"], labels: ["hit rate"], omlx: true, fmt: (v) => `${v.toFixed(0)}%` },
@@ -715,6 +741,7 @@ async function renderDetail(id, initialRange = "1h") {
 
     const charts = {};
     const statsEls = {};
+    const projEls = {};
     const panelsDiv = view.querySelector("#panels");
     for (const p of panels) {
       const div = document.createElement("div");
@@ -722,14 +749,17 @@ async function renderDetail(id, initialRange = "1h") {
       let right = "";
       if (d.has_omlx === false && p.omlx) right = `<span class="head-right">no oMLX</span>`;
       else if (d.has_comfyui === false && p.comfy) right = `<span class="head-right">no ComfyUI</span>`;
+      else if (d.has_hostmon === false && p.hostmon) right = `<span class="head-right">no hostmon</span>`;
+      else if (p.projection) right = `<span class="head-right"></span>`;
       div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas><div class="chart-stats"></div></div>`;
       panelsDiv.appendChild(div);
-      charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt });
+      charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt, ymax: p.ymax });
       liveCharts.push(charts[p.title]);
       statsEls[p.title] = div.querySelector(".chart-stats");
+      if (p.projection && d.has_hostmon !== false) projEls[p.title] = div.querySelector(".head-right");
     }
 
-    return { d, charts, statsEls, groups: liveGroups };
+    return { d, charts, statsEls, projEls, groups: liveGroups };
   }
 
   let ctx;
@@ -857,6 +887,9 @@ async function renderDetail(id, initialRange = "1h") {
       if (p.pressureSeries && list.length) {
         const seg = pressureSegColors(list[0].data, series[p.pressureSeries] || []);
         if (seg) list[0].colors = seg;
+      }
+      if (p.projection && ctx.projEls[p.title]) {
+        ctx.projEls[p.title].textContent = list.length ? diskFullText(list[0].data) : "";
       }
       ctx.charts[p.title].setSeries(list);
       const statsEl = ctx.statsEls[p.title];
