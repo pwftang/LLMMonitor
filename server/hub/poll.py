@@ -1,7 +1,8 @@
 """Poll one device: macmon /json + omlx admin API + ComfyUI → metrics + latest state.
 
 Metric namespaces written to the store:
-  sys.*   — macmon system metrics (kind="system")
+  sys.*   — macmon system metrics (kind="system"); diskmon contributes
+            sys.disk_* into the same namespace (opt-in per device)
   llm.*   — omlx /admin/api/stats (kind="llm")
   llm.model.<slug>.* — per-model series from /admin/api/models (kind="models")
   comfyui.* — ComfyUI /queue + /system_stats (kind="comfyui"; opt-in per device)
@@ -109,29 +110,33 @@ def extract_omlx_stats(p: dict) -> dict[str, float]:
     add("llm.active_reqs", p.get("total_active_requests"))
     add("llm.waiting_reqs", p.get("total_waiting_requests"))
 
-    # Disk usage for the omlx cache volume. Expected omlx /admin/api/stats
-    # extension (not yet shipped): a "disk" object with byte values, e.g.
-    #   "disk": {"total_bytes": ..., "used_bytes": ..., "free_bytes": ...}
-    # Flat top-level keys are accepted as a fallback. Everything is optional;
-    # when omlx predates the extension no disk series are emitted and the UI
-    # hides the indicator.
-    disk = p.get("disk")
-    src: dict = disk if isinstance(disk, dict) else p
-    total = _first_key(src, ("total_bytes", "disk_total_bytes", "total"))
-    free = _first_key(src, ("free_bytes", "disk_free_bytes", "free"))
-    used = _first_key(src, ("used_bytes", "disk_used_bytes", "used"))
-    if isinstance(total, (int, float)) and total:
-        out["llm.disk_total_gb"] = _gb(total)
-        if isinstance(used, (int, float)):
-            out["llm.disk_used_gb"] = _gb(used)
-        elif isinstance(free, (int, float)):
-            out["llm.disk_used_gb"] = _gb(total - free)
-        if isinstance(free, (int, float)):
-            out["llm.disk_free_gb"] = _gb(free)
-        elif isinstance(used, (int, float)):
-            out["llm.disk_free_gb"] = _gb(total - used)
-        if "llm.disk_used_gb" in out:
-            out["llm.disk_used_pct"] = max(0.0, min(1.0, out["llm.disk_used_gb"] / out["llm.disk_total_gb"]))
+    return out
+
+
+def extract_disk(p: dict) -> dict[str, float]:
+    """diskmon /json payload → sys.disk_* series.
+
+    Payload is {"timestamp", "path", "total_bytes", "used_bytes",
+    "free_bytes"}; all keys are emitted by the agent, but treat each as
+    optional so a partial payload degrades gracefully.
+    """
+    out: dict[str, float] = {}
+    total = p.get("total_bytes")
+    used = p.get("used_bytes")
+    free = p.get("free_bytes")
+    if not (isinstance(total, (int, float)) and total):
+        return out
+    out["sys.disk_total_gb"] = _gb(total)
+    if isinstance(used, (int, float)):
+        out["sys.disk_used_gb"] = _gb(used)
+    elif isinstance(free, (int, float)):
+        out["sys.disk_used_gb"] = _gb(total - free)
+    if isinstance(free, (int, float)):
+        out["sys.disk_free_gb"] = _gb(free)
+    elif isinstance(used, (int, float)):
+        out["sys.disk_free_gb"] = _gb(total - used)
+    if "sys.disk_used_gb" in out:
+        out["sys.disk_used_pct"] = max(0.0, min(1.0, out["sys.disk_used_gb"] / out["sys.disk_total_gb"]))
     return out
 
 
@@ -217,6 +222,7 @@ class DeviceState:
         self.macmon_ok: bool | None = None
         self.macmon_last_ok: float | None = None
         self.comfy_ok: bool | None = None
+        self.disk_ok: bool | None = None
         # Live render progress pushed by the ComfyUI /ws watch loop:
         # {"step", "total", "node", "started_at", "elapsed_s"} while running.
         self.comfy_progress: dict[str, Any] | None = None
@@ -242,6 +248,8 @@ class DeviceState:
             "has_omlx": base is not None,
             "has_macmon": self.device.macmon_url is not None,
             "has_comfyui": self.device.comfyui_base is not None,
+            "has_diskmon": self.device.diskmon_url is not None,
+            "disk_ok": self.disk_ok,
             "comfy_ok": self.comfy_ok,
             "omlx_admin_url": f"{base}/admin" if base else None,
             "tailscale_ip": self.tailscale_ip,
@@ -359,13 +367,15 @@ class DevicePoller:
             ok |= await self._tick_omlx_stats()
         if self.device.comfyui_base:
             ok |= await self._tick_comfyui()
+        if self.device.diskmon_url:
+            ok |= await self._tick_diskmon()
         if ok:
             self.state.mark_ok()
         else:
             self.state.mark_offline("unreachable")
-            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s)",
+            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s diskmon=%s)",
                         self.device.id, self.device.macmon_url, self.device.omlx_base,
-                        self.device.comfyui_base)
+                        self.device.comfyui_base, self.device.diskmon_url)
         return ok
 
     async def _tick_macmon(self) -> bool:
@@ -391,6 +401,31 @@ class DevicePoller:
         series = extract_system(payload)
         self.state.system = series
         self.state.raw["macmon"] = payload
+        self.store.insert(self.device.id, time.time(), "system", series)
+        return True
+
+    async def _tick_diskmon(self) -> bool:
+        assert self._client is not None and self.device.diskmon_url is not None
+        was_ok = self.state.disk_ok
+        try:
+            r = await self._client.get(self.device.diskmon_url)
+            r.raise_for_status()
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise ValueError("diskmon /json returned non-object payload")
+        except Exception as e:  # noqa: BLE001
+            if was_ok is not False:
+                log.warning("%s diskmon unreachable: %s", self.device.id, e)
+            self.state.disk_ok = False
+            return False
+        if was_ok is False:
+            log.info("%s diskmon recovered", self.device.id)
+        self.state.disk_ok = True
+        series = extract_disk(payload)
+        # Merge, don't assign: macmon owns state.system and replaces it
+        # wholesale every tick; diskmon only contributes the sys.disk_* keys.
+        self.state.system.update(series)
+        self.state.raw["diskmon"] = payload
         self.store.insert(self.device.id, time.time(), "system", series)
         return True
 

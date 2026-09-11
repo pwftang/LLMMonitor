@@ -15,6 +15,7 @@ from hub.poll import (
     DevicePoller,
     DeviceState,
     extract_comfyui,
+    extract_disk,
     extract_model_series,
     extract_omlx_stats,
     extract_system,
@@ -86,6 +87,15 @@ COMFY_SYS = {
     ],
 }
 
+# diskmon /json (macos/install-diskmon-agent.sh, port 9091).
+DISKMON_PAYLOAD = {
+    "timestamp": 1757548800.0,
+    "path": "/",
+    "total_bytes": 2 * 1024**4,
+    "used_bytes": 1024**4,
+    "free_bytes": 1024**4,
+}
+
 
 class TestExtractSystem:
     def test_full_payload(self):
@@ -129,27 +139,36 @@ class TestExtractOmlxStats:
     def test_partial_payload(self):
         assert extract_omlx_stats({"avg_generation_tps": 3.2}) == {"llm.gen_tps": 3.2}
 
-    def test_disk_nested(self):
-        # prospective omlx extension: "disk": {total|used|free}_bytes
-        m = extract_omlx_stats(
-            {"disk": {"total_bytes": 2 * 1024**4, "used_bytes": 1024**4}}
-        )
-        assert m["llm.disk_total_gb"] == pytest.approx(2 * 1024)
-        assert m["llm.disk_used_gb"] == pytest.approx(1024)
-        assert m["llm.disk_free_gb"] == pytest.approx(1024)
-        assert m["llm.disk_used_pct"] == pytest.approx(0.5)
 
-    def test_disk_flat_keys_and_free_only(self):
-        m = extract_omlx_stats({"disk_total_bytes": 100 * 1024**3, "disk_free_bytes": 25 * 1024**3})
-        assert m["llm.disk_total_gb"] == pytest.approx(100)
-        assert m["llm.disk_free_gb"] == pytest.approx(25)
-        assert m["llm.disk_used_gb"] == pytest.approx(75)
-        assert m["llm.disk_used_pct"] == pytest.approx(0.75)
+class TestExtractDisk:
+    def test_full_payload(self):
+        m = extract_disk(DISKMON_PAYLOAD)
+        assert m["sys.disk_total_gb"] == pytest.approx(2 * 1024)
+        assert m["sys.disk_used_gb"] == pytest.approx(1024)
+        assert m["sys.disk_free_gb"] == pytest.approx(1024)
+        assert m["sys.disk_used_pct"] == pytest.approx(0.5)
 
-    def test_disk_absent(self):
-        # omlx builds predating the disk extension emit nothing; UI stays hidden
-        m = extract_omlx_stats({})
-        assert not any(k.startswith("llm.disk_") for k in m)
+    def test_free_only_derives_used(self):
+        m = extract_disk({"total_bytes": 100 * 1024**3, "free_bytes": 25 * 1024**3})
+        assert m["sys.disk_total_gb"] == pytest.approx(100)
+        assert m["sys.disk_free_gb"] == pytest.approx(25)
+        assert m["sys.disk_used_gb"] == pytest.approx(75)
+        assert m["sys.disk_used_pct"] == pytest.approx(0.75)
+
+    def test_used_only_derives_free(self):
+        m = extract_disk({"total_bytes": 100 * 1024**3, "used_bytes": 30 * 1024**3})
+        assert m["sys.disk_used_gb"] == pytest.approx(30)
+        assert m["sys.disk_free_gb"] == pytest.approx(70)
+        assert m["sys.disk_used_pct"] == pytest.approx(0.3)
+
+    def test_no_total_means_no_series(self):
+        # without total_bytes there is no usable reference — emit nothing
+        assert extract_disk({}) == {}
+        assert extract_disk({"used_bytes": 5}) == {}
+
+    def test_used_pct_clamped(self):
+        m = extract_disk({"total_bytes": 1024**3, "used_bytes": 2 * 1024**3})
+        assert m["sys.disk_used_pct"] == 1.0
 
 
 class TestExtractComfyui:
@@ -410,6 +429,20 @@ macmon_port = 9091
         assert comfy.comfyui_base == "http://b:8188"
         assert off.comfyui_port == 0 and off.comfyui_base is None
 
+    def test_disk_opt_in(self, tmp_path):
+        # Like ComfyUI, diskmon has no default port: omitted (or 0) must
+        # disable it, an explicit port enables it.
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "No Disk"\nhost = "a"\n'
+            '[[devices]]\nname = "Disk"\nhost = "b"\ndisk_port = 9091\n'
+            '[[devices]]\nname = "Off"\nhost = "c"\ndisk_port = 0\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        no_disk, disk, off = cfg.devices
+        assert no_disk.disk_port is None and no_disk.diskmon_url is None
+        assert disk.diskmon_url == "http://b:9091/json"
+        assert off.disk_port == 0 and off.diskmon_url is None
+
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
             '[[devices]]\nname = "A B"\nhost = "x"\n[[devices]]\nname = "a-b"\nhost = "y"\n'
@@ -503,6 +536,61 @@ class TestPoller:
         assert state.macmon_ok is True
         assert state.macmon_last_ok is not None
         assert state.public()["macmon_ok"] is True
+        store.close()
+
+    async def test_diskmon_success_merges_into_system(self):
+        def handler(request):
+            # macmon and diskmon both serve /json — route by port.
+            if request.url.port == 9091:
+                return httpx.Response(200, json=DISKMON_PAYLOAD)
+            return httpx.Response(200, json=MACMON_PAYLOAD)
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, disk_port=9091)
+        poller, state, store = self._poller(handler, dev)
+        assert state.disk_ok is None  # not polled yet → chip hidden
+        assert await poller._tick_fast() is True
+        assert state.disk_ok is True
+        # macmon keys survive the merge (macmon assigns, diskmon updates)
+        assert state.system["sys.cpu_temp_c"] == pytest.approx(43.73614)
+        assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
+        assert state.system["sys.disk_free_gb"] == pytest.approx(1024.0)
+        assert state.system["sys.disk_total_gb"] == pytest.approx(2048.0)
+        assert state.raw["diskmon"] == DISKMON_PAYLOAD
+        assert state.public()["disk_ok"] is True
+        assert state.public()["has_diskmon"] is True
+        store.commit()
+        h = store.history("t", ["sys.disk_used_pct"], time.time() - 10, time.time() + 1)
+        assert h["sys.disk_used_pct"][-1][1] == pytest.approx(0.5)
+        store.close()
+
+    async def test_diskmon_failure_tracked_per_source(self):
+        # diskmon down must not take the device offline — macmon still serves.
+        fail = {"disk": False}
+
+        def handler(request):
+            if request.url.port == 9091:
+                if fail["disk"]:
+                    raise httpx.ConnectError("connection refused")
+                return httpx.Response(200, json=DISKMON_PAYLOAD)
+            return httpx.Response(200, json=MACMON_PAYLOAD)
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, disk_port=9091)
+        poller, state, store = self._poller(handler, dev)
+        assert state.disk_ok is None
+
+        fail["disk"] = True
+        assert await poller._tick_fast() is True
+        assert state.online  # device stays "online" via macmon
+        assert state.disk_ok is False
+        assert state.system["sys.cpu_temp_c"] == pytest.approx(43.73614)
+        assert "sys.disk_used_pct" not in state.system
+        assert state.public()["disk_ok"] is False
+
+        fail["disk"] = False
+        assert await poller._tick_fast() is True
+        assert state.disk_ok is True
+        assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
+        assert state.public()["disk_ok"] is True
         store.close()
 
     async def test_models_tick_unwraps_payload_for_frontend(self):

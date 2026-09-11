@@ -441,14 +441,14 @@ async function renderOverview() {
       stateEl.textContent = state[1];
       stateEl.className = `card-state st-${state[0] || "idle"}`;
       card.classList.toggle("sys-stale", macmonWarn(macmonWarnEl, fresh));
-      const dPct = val(llm, "llm.disk_used_pct");
-      const dFree = val(llm, "llm.disk_free_gb");
+      const dPct = val(s, "sys.disk_used_pct");
+      const dFree = val(s, "sys.disk_free_gb");
       const diskOn = dPct != null && dFree != null;
       diskEl.hidden = !diskOn;
       if (diskOn) {
         const pct = dPct * 100;
         diskEl.className = `disk-chip${pct > 92 ? " crit" : pct > 80 ? " warn" : ""}`;
-        diskEl.title = `${val(llm, "llm.disk_used_gb").toFixed(0)} GB used of ${val(llm, "llm.disk_total_gb").toFixed(0)} GB`;
+        diskEl.title = `${val(s, "sys.disk_used_gb").toFixed(0)} GB used of ${val(s, "sys.disk_total_gb").toFixed(0)} GB`;
         diskEl.innerHTML = `${icon("database")}<span>${fmtDiskSize(dFree)} free</span>`;
       }
       verEl.textContent = fresh.omlx_version ? `omlx ${fresh.omlx_version}` : "";
