@@ -43,21 +43,22 @@ const val = (obj, key) => (obj && obj[key] != null ? obj[key] : null);
 const cssColor = (name, fallback) =>
   getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 
-// Activity Monitor-style colour per point from a pressure series (0-1):
-// green <80%, amber 80-92%, red >92% — the same thresholds as the chips.
-// Points before the first pressure sample get null (series' own colour);
-// afterwards the colour carries forward across sampling gaps. Returns null
-// when there is no pressure data at all, so the chart keeps its normal look.
+// Activity Monitor-style colouring per point from a pressure series (0-1):
+// amber 80-92%, red >92% (the same thresholds as the chips), and null for
+// normal pressure so the trace and fill fall back to the series colour
+// instead of washing the chart green and masking the elevated spans. Points
+// before the first pressure sample are null too; afterwards the colour
+// carries forward across sampling gaps. Returns null when there is no
+// pressure data at all, so the chart keeps its normal look.
 function pressureSegColors(data, pressureData) {
   if (!pressureData.length) return null;
-  const green = cssColor("--green", "#22c55e");
   const amber = cssColor("--amber", "#f59e0b");
   const red = cssColor("--red", "#ef4444");
   let pi = 0, last = null;
   return data.map(([t]) => {
     while (pi + 1 < pressureData.length && pressureData[pi + 1][0] <= t) pi++;
     const [pt, pv] = pressureData[pi];
-    if (pt <= t) last = pv * 100 > 92 ? red : pv * 100 > 80 ? amber : green;
+    if (pt <= t) last = pv * 100 > 92 ? red : pv * 100 > 80 ? amber : null;
     return last;
   });
 }

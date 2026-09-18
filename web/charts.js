@@ -65,10 +65,10 @@ export class Chart {
     // shaded envelope behind the line (rollup min/max). colors is an optional
     // per-point array of CSS colours (null entries fall back to the series
     // colour): when present the line is stroked segment-by-segment and the
-    // area fill uses the latest segment colour — used for Activity-Monitor-
+    // area fill uses the latest point's colour — used for Activity-Monitor-
     // style pressure colouring on the memory charts. regions is an optional
     // [{t0, t1, color}] list of time spans painted as full-height translucent
-    // strips behind everything (axes and series) — used to mark elevated-
+    // strips above the fills but under the trace — used to mark elevated-
     // pressure periods vertically across the whole chart.
     this.series = series.map((s, i) => ({ _ci: i, ...s }));
     this.draw();
@@ -155,32 +155,15 @@ export class Chart {
     const x = (t) => L.x0 + ((t - b.tMin) / span) * (L.x1 - L.x0);
     const y = (v) => L.y1 - ((v - this.opts.ymin) / (yTop - this.opts.ymin)) * (L.y1 - L.y0);
 
-    // background time regions first so gridlines and traces paint over them
-    for (const s of this.series) {
-      if (!s.regions) continue;
-      ctx.globalAlpha = 0.12;
-      for (const r of s.regions) {
-        const rx0 = Math.max(x(r.t0), L.x0);
-        const rx1 = Math.min(x(r.t1), L.x1);
-        if (rx1 <= rx0) continue;
-        ctx.fillStyle = r.color;
-        ctx.fillRect(rx0, L.y0, rx1 - rx0, L.y1 - L.y0);
-      }
-      ctx.globalAlpha = 1;
-    }
-
     if (this.opts.axes) this._drawAxes(x, y, b, yTop, L, span);
 
+    // fills and envelopes, then regions, then strokes: regions sit above the
+    // (possibly tinted) fills so the high-pressure strips are never masked
     for (const s of this.series) {
       if (s.data.length === 0) continue;
       const color = this._color(s);
-      // pressure-coloured series tint their fill with the latest segment colour
-      let segTint = null;
-      if (s.colors) {
-        for (let i = s.colors.length - 1; i >= 0; i--) {
-          if (s.colors[i]) { segTint = s.colors[i]; break; }
-        }
-      }
+      // pressure-coloured series tint their fill with the latest point's colour
+      const segTint = s.colors ? s.colors[s.colors.length - 1] : null;
       const fillColor = segTint || color;
       const hasBand = s.band && s.band.min.length && s.band.max.length;
       if (hasBand) {
@@ -215,6 +198,28 @@ export class Chart {
         ctx.fill();
         ctx.globalAlpha = 1;
       }
+    }
+
+    for (const s of this.series) {
+      if (!s.regions) continue;
+      for (const r of s.regions) {
+        const rx0 = Math.max(x(r.t0), L.x0);
+        const rx1 = Math.min(x(r.t1), L.x1);
+        if (rx1 <= rx0) continue;
+        ctx.fillStyle = r.color;
+        ctx.globalAlpha = 0.3;
+        ctx.fillRect(rx0, L.y0, rx1 - rx0, L.y1 - L.y0);
+        // full-opacity edge across the strip top so the region is unmissable
+        // even where the fill underneath is a competing colour
+        ctx.globalAlpha = 0.95;
+        ctx.fillRect(rx0, L.y0, rx1 - rx0, 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    for (const s of this.series) {
+      if (s.data.length === 0) continue;
+      const color = this._color(s);
       ctx.lineWidth = 1.4;
       ctx.lineJoin = "round";
       if (s.colors) {
