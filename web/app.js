@@ -62,6 +62,31 @@ function pressureSegColors(data, pressureData) {
   });
 }
 
+// Elevated-pressure time spans as [{t0, t1, color}] chart regions, painted
+// top-to-bottom behind a chart so high-pressure periods are visible even when
+// the trace sits low: amber 80-92%, red >92% (same thresholds as the chips).
+// Normal periods get no strip so breaches stand out. Each span runs until the
+// next sample (the last sample's own span is zero-width and skipped). Returns
+// null when pressure never exceeds 80%.
+function pressureRegions(pressureData) {
+  const amber = cssColor("--amber", "#f59e0b");
+  const red = cssColor("--red", "#ef4444");
+  const regions = [];
+  let cur = null;
+  for (let i = 0; i < pressureData.length; i++) {
+    const [t, pv] = pressureData[i];
+    const color = pv * 100 > 92 ? red : pv * 100 > 80 ? amber : null;
+    const end = i + 1 < pressureData.length ? pressureData[i + 1][0] : t;
+    if (color && cur && cur.color === color) cur.t1 = end;
+    else {
+      if (cur) regions.push(cur);
+      cur = color ? { t0: t, t1: end, color } : null;
+    }
+  }
+  if (cur) regions.push(cur);
+  return regions.length ? regions : null;
+}
+
 // Extrapolate a %-full series (linear least-squares) to a "disk full in
 // ~N d" estimate for the disk panel's head label — "not growing" when the
 // slope is flat/negative (the common case), "" without enough points.
@@ -662,6 +687,8 @@ async function renderOverview() {
           if (def.pressure) {
             const seg = pressureSegColors(data, pressure);
             if (seg) series.colors = seg;
+            const regions = pressureRegions(pressure);
+            if (regions) series.regions = regions;
           }
           chart.setSeries([series]);
         }
@@ -709,7 +736,7 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "GPU temperature", metrics: ["sys.gpu_temp_c"], labels: ["gpu"], macmon: true, fmt: (v) => `${v.toFixed(1)}°C` },
     { title: "Clock speeds", metrics: ["sys.ecpu_freq_mhz", "sys.pcpu_freq_mhz", "sys.gpu_freq_mhz"], labels: ["e-cores", "p-cores", "gpu"], macmon: true, fmt: (v) => `${v.toFixed(0)} MHz` },
     { title: "RAM utilisation", metrics: ["sys.ram_used_pct"], labels: ["ram"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
-    { title: "Memory pressure", metrics: ["sys.mem_pressure_pct"], labels: ["pressure"], pct: true, hostmon: true, ymax: 100, fmt: (v) => `${v.toFixed(0)}%` },
+    { title: "Memory pressure", metrics: ["sys.mem_pressure_pct"], labels: ["pressure"], pct: true, hostmon: true, ymax: 100, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
     { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb", "sys.swap_used_gb"], labels: ["ram used", "models", "swap"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Disk usage", metrics: ["sys.disk_used_pct"], labels: ["full"], pct: true, hostmon: true, ymax: 100, projection: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "Network", metrics: ["sys.net_rx_Bps", "sys.net_tx_Bps"], labels: ["download", "upload"], hostmon: true, fmt: fmtBps },
@@ -931,6 +958,8 @@ async function renderDetail(id, initialRange = "1h") {
       if (p.pressureSeries && list.length) {
         const seg = pressureSegColors(list[0].data, series[p.pressureSeries] || []);
         if (seg) list[0].colors = seg;
+        const regions = pressureRegions(series[p.pressureSeries] || []);
+        if (regions) list[0].regions = regions;
       }
       if (p.projection && ctx.projEls[p.title]) {
         ctx.projEls[p.title].textContent = list.length ? diskFullText(list[0].data) : "";

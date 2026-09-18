@@ -66,7 +66,10 @@ export class Chart {
     // per-point array of CSS colours (null entries fall back to the series
     // colour): when present the line is stroked segment-by-segment and the
     // area fill uses the latest segment colour — used for Activity-Monitor-
-    // style pressure colouring on the memory charts.
+    // style pressure colouring on the memory charts. regions is an optional
+    // [{t0, t1, color}] list of time spans painted as full-height translucent
+    // strips behind everything (axes and series) — used to mark elevated-
+    // pressure periods vertically across the whole chart.
     this.series = series.map((s, i) => ({ _ci: i, ...s }));
     this.draw();
   }
@@ -151,6 +154,20 @@ export class Chart {
     const span = b.tMax - b.tMin;
     const x = (t) => L.x0 + ((t - b.tMin) / span) * (L.x1 - L.x0);
     const y = (v) => L.y1 - ((v - this.opts.ymin) / (yTop - this.opts.ymin)) * (L.y1 - L.y0);
+
+    // background time regions first so gridlines and traces paint over them
+    for (const s of this.series) {
+      if (!s.regions) continue;
+      ctx.globalAlpha = 0.12;
+      for (const r of s.regions) {
+        const rx0 = Math.max(x(r.t0), L.x0);
+        const rx1 = Math.min(x(r.t1), L.x1);
+        if (rx1 <= rx0) continue;
+        ctx.fillStyle = r.color;
+        ctx.fillRect(rx0, L.y0, rx1 - rx0, L.y1 - L.y0);
+      }
+      ctx.globalAlpha = 1;
+    }
 
     if (this.opts.axes) this._drawAxes(x, y, b, yTop, L, span);
 
