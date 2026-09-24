@@ -223,6 +223,18 @@ const COMFY_GROUP = ["comfyui", "layers", [
   ["version", (s, llm, d) => comfyOf(d)?.version || "—"],
 ]];
 
+// Inserted after the comfy group (or after "inference" without comfy) only
+// for router-enabled devices.
+const ROUTER_GROUP = ["router", "globe", [
+  ["status", (s, llm, d) => routerStatusText(d)],
+  ["backends", (s, llm, d) => routerBackendsText(d)],
+  ["in-flight", (s, llm, d) => routerAdminText(d, (st) => num0(st.workload?.active))],
+  ["avg wait", (s, llm, d) => routerAdminText(d, (st) => {
+    const w = st.wait_metrics?.avg;
+    return w == null ? "—" : `${Number(w).toFixed(2)} s`;
+  })],
+]];
+
 /* ---------- oMLX-style bits ---------- */
 const gbHTML = (v, dp) => (v == null ? "—" : `${v.toFixed(dp)}<span class="unit">GB</span>`);
 const BIG_STATS = [
@@ -356,6 +368,89 @@ function topProcsHTML(procs) {
 // entirely (like stale macmon), so "no payload + comfy_ok false" = down.
 const comfyOf = (d) => (d && d.raw && d.raw.comfyui ? d.raw.comfyui : null);
 
+// raw.router is {ready, stats, models}; stats/models are null whenever the
+// hub has no (or a rejected) api_key for the router's Bearer-protected /admin.
+const routerOf = (d) => (d && d.raw && d.raw.router ? d.raw.router : null);
+const routerStatusText = (d) => {
+  if (!routerOf(d)) return d.router_ok === false ? "unreachable" : "—";
+  return routerOf(d).ready?.status === "ready" ? "ready" : "not ready";
+};
+const routerBackendsText = (d) => {
+  const b = routerOf(d)?.ready?.backends;
+  if (!b || typeof b !== "object") return "—";
+  const names = Object.keys(b);
+  if (!names.length) return "none";
+  const healthy = names.filter((n) => b[n] && b[n].healthy).length;
+  return `${healthy}/${names.length} healthy`;
+};
+// "key needed" only when auth was attempted and rejected; a hub with no key
+// configured just shows the public /ready cells.
+const routerAdminText = (d, fn) => {
+  if (d.router_auth_ok === false) return "key needed";
+  const st = routerOf(d)?.stats;
+  return st ? fn(st) : "—";
+};
+
+function backendsHTML(d) {
+  const b = routerOf(d)?.ready?.backends;
+  const names = b && typeof b === "object" ? Object.keys(b) : [];
+  if (!names.length) return `<div class="rows"><div class="m-none">no backend data</div></div>`;
+  return `<div class="rows">${names
+    .map((name) => {
+      const bk = b[name] || {};
+      const ep = bk.engine_pool || {};
+      const ok = !!bk.healthy;
+      const mem = ep.model_memory_bytes != null ? ep.model_memory_bytes / 1024 ** 3 : null;
+      const ceil = ep.memory_ceiling_bytes != null ? ep.memory_ceiling_bytes / 1024 ** 3 : null;
+      const size = mem != null && ceil != null && ceil > 0
+        ? `${mem.toFixed(1)} / ${ceil.toFixed(0)} GB`
+        : mem != null ? fmtGB(mem) : "—";
+      const head = ep.memory_headroom_bytes != null
+        ? ` · ${(ep.memory_headroom_bytes / 1024 ** 3).toFixed(1)} GB headroom`
+        : "";
+      const models = Array.isArray(bk.models) && bk.models.length ? bk.models.join(", ") : null;
+      return `<div class="row">
+        <div class="m-main">
+          <span class="m-name">${esc(name)}</span>
+          ${models ? `<span class="m-meta">${esc(models)}</span>` : ""}
+        </div>
+        <div class="m-right">
+          <span class="m-state ${ok ? "st-ok" : "st-crit"}"><span class="status-dot ${ok ? "ok" : "crit"}"></span>${ok ? "healthy" : "unhealthy"}</span>
+          <span class="m-size" title="model memory / pool ceiling${head}">${esc(size)}</span>
+        </div>
+      </div>`;
+    })
+    .join("")}</div>`;
+}
+
+// Recent routed requests, newest first. The hub drains the router's completion
+// records into its own DB, so these survive restarts of either side.
+function routeEventsHTML(events) {
+  if (!Array.isArray(events) || !events.length)
+    return `<div class="rows"><div class="m-none">no routed requests recorded yet</div></div>`;
+  return `<div class="rows">${events
+    .map((e) => {
+      const ok = Number(e.status_code) < 400;
+      const meta = [
+        e.actual_seconds != null ? fmtRunDur(e.actual_seconds) : null,
+        e.output_tokens != null ? `${fmtTokens(e.output_tokens)} out` : null,
+        Number(e.waited_seconds) > 0 ? `waited ${Number(e.waited_seconds).toFixed(1)}s` : null,
+      ].filter(Boolean).join(" · ");
+      return `<div class="row" title="${esc(e.request_id || "")}">
+        <div class="m-main">
+          <span class="m-name">${esc(e.profile || e.requested_model || "—")}</span>
+          <span class="m-meta">→ ${esc(e.deployment || "—")}</span>
+          ${meta ? `<span class="m-meta">${esc(meta)}</span>` : ""}
+        </div>
+        <div class="m-right">
+          <span class="m-state ${ok ? "st-ok" : "st-crit"}">${esc(String(e.status_code ?? "—"))}</span>
+          <span class="m-size">${esc(ago(e.recorded_at))}</span>
+        </div>
+      </div>`;
+    })
+    .join("")}</div>`;
+}
+
 /* ---------- icons + theme ---------- */
 const ICONS = {
   zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>',
@@ -426,7 +521,8 @@ async function renderOverview() {
   for (const d of devices) {
     const card = document.createElement("div");
     card.className =
-      "card" + (d.online ? "" : " offline") + (d.has_comfyui ? " has-comfy" : "");
+      "card" + (d.online ? "" : " offline") + (d.has_comfyui ? " has-comfy" : "") +
+      (d.has_router ? " has-router" : "");
     card.onclick = () => (location.hash = `#/device/${encodeURIComponent(d.id)}`);
 
     card.innerHTML = `
@@ -442,6 +538,9 @@ async function renderOverview() {
         </div>
         ${d.omlx_admin_url
           ? `<a class="icon-btn card-admin" href="${esc(d.omlx_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx admin dashboard" aria-label="open omlx admin dashboard">${icon("ext")}</a>`
+          : ""}
+        ${d.router_admin_url
+          ? `<a class="icon-btn card-admin" href="${esc(d.router_admin_url)}" target="_blank" rel="noopener noreferrer" title="open omlx-router dashboard" aria-label="open omlx-router dashboard">${icon("ext")}</a>`
           : ""}
         <span class="macmon-warn" hidden>macmon unreachable</span>
         <span class="mem-chip" hidden></span>
@@ -501,12 +600,22 @@ async function renderOverview() {
             <div class="mbar mbar-use comfy-bar"><div class="mbar-fill" style="width:0%"></div></div>
           </div>
         </div>` : ""}
+        ${d.has_router ? `
+        <div class="ov-sec sec-router">
+          <div class="ov-sec-head">${icon("globe")}<span class="kicker">router</span></div>
+          <div class="i-stats">
+            <div class="stat"><span class="label">status</span><span class="value i-val" data-r="stat">—</span></div>
+            <div class="stat"><span class="label">backends</span><span class="value i-val" data-r="bak">—</span></div>
+            <div class="stat"><span class="label">in-flight</span><span class="value i-val" data-r="inf">—</span></div>
+            <div class="stat"><span class="label">avg wait</span><span class="value i-val" data-r="wait">—</span></div>
+          </div>
+        </div>` : ""}
       </div>
     `;
     grid.appendChild(card);
 
-    const adminLink = card.querySelector(".card-admin");
-    if (adminLink) adminLink.addEventListener("click", (e) => e.stopPropagation());
+    for (const a of card.querySelectorAll(".card-admin"))
+      a.addEventListener("click", (e) => e.stopPropagation());
 
     const dotEl = card.querySelector(".status-dot");
     const stateEl = card.querySelector(".card-state");
@@ -524,6 +633,8 @@ async function renderOverview() {
     for (const el of card.querySelectorAll(".i-val[data-p]")) pEls[el.dataset.p] = el;
     const cEls = {};
     for (const el of card.querySelectorAll(".i-val[data-c]")) cEls[el.dataset.c] = el;
+    const rEls = {};
+    for (const el of card.querySelectorAll(".i-val[data-r]")) rEls[el.dataset.r] = el;
     const comfyProgEl = card.querySelector(".comfy-prog");
     const comfyBarFillEl = comfyProgEl ? comfyProgEl.querySelector(".mbar-fill") : null;
     const ramValEl = card.querySelector(".mbar-val");
@@ -646,6 +757,16 @@ async function renderOverview() {
         }
       }
 
+      if (rEls.stat) {
+        rEls.stat.textContent = routerStatusText(fresh);
+        rEls.bak.textContent = routerBackendsText(fresh);
+        rEls.inf.textContent = routerAdminText(fresh, (st) => num0(st.workload?.active));
+        rEls.wait.textContent = routerAdminText(fresh, (st) => {
+          const w = st.wait_metrics?.avg;
+          return w == null ? "—" : `${Number(w).toFixed(2)} s`;
+        });
+      }
+
       hwEl.innerHTML = hwLineHTML(s, llm);
       agoEl.textContent = fresh.online ? "" : `last seen ${ago(fresh.last_seen)}`;
     };
@@ -725,6 +846,8 @@ async function renderDetail(id, initialRange = "1h") {
   let lastModelsHTML = "";
   let lastAvailHTML = "";
   let lastProcsHTML = "";
+  let lastBackendsHTML = "";
+  let lastEventsHTML = "";
   const gen = routeGen;
   disposeCharts();
   view.innerHTML = `<div class="empty">loading…</div>`;
@@ -738,7 +861,7 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "Clock speeds", metrics: ["sys.ecpu_freq_mhz", "sys.pcpu_freq_mhz", "sys.gpu_freq_mhz"], labels: ["e-cores", "p-cores", "gpu"], macmon: true, fmt: (v) => `${v.toFixed(0)} MHz` },
     { title: "RAM utilisation", metrics: ["sys.ram_used_pct"], labels: ["ram"], pct: true, macmon: true, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
     { title: "Memory pressure", metrics: ["sys.mem_pressure_pct"], labels: ["pressure"], pct: true, hostmon: true, ymax: 100, fmt: (v) => `${v.toFixed(0)}%`, pressureSeries: "sys.mem_pressure_pct" },
-    { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb", "sys.swap_used_gb"], labels: ["ram used", "models", "swap"], dynamic: "models", fmt: (v) => `${v.toFixed(1)} GB` },
+    { title: "Memory", metrics: ["sys.ram_used_gb", "llm.model_mem_gb", "sys.swap_used_gb"], labels: ["ram used", "models", "swap"], dynamic: "models", sysmem: true, fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Disk usage", metrics: ["sys.disk_used_pct"], labels: ["full"], pct: true, hostmon: true, ymax: 100, projection: true, fmt: (v) => `${v.toFixed(0)}%` },
     { title: "Network", metrics: ["sys.net_rx_Bps", "sys.net_tx_Bps"], labels: ["download", "upload"], hostmon: true, fmt: fmtBps },
     { title: "Token throughput", metrics: ["llm.prefill_tps", "llm.gen_tps"], labels: ["prefill", "generation"], omlx: true, fmt: (v) => `${v.toFixed(1)} t/s` },
@@ -748,10 +871,26 @@ async function renderDetail(id, initialRange = "1h") {
     { title: "ComfyUI queue", metrics: ["comfyui.queue_running", "comfyui.queue_pending"], labels: ["running", "queued"], comfy: true, fmt: (v) => v.toFixed(0) },
     { title: "ComfyUI model memory", metrics: ["comfyui.model_mem_gb"], labels: ["models"], comfy: true, fmt: (v) => `${v.toFixed(1)} GB` },
     { title: "Fan", metrics: ["sys.fan_rpm_max"], labels: ["rpm"], macmon: true, fmt: (v) => `${v.toLocaleString()} rpm` },
+    { title: "Router readiness", metrics: ["router.status_ready", "router.backends_healthy"], labels: ["ready", "healthy backends"], router: true, fmt: (v) => v.toFixed(0) },
+    { title: "Router in-flight", metrics: ["router.inflight"], labels: ["all deployments"], dynamic: "deployments", router: true, fmt: (v) => v.toFixed(0) },
+    { title: "Router avg wait", metrics: ["router.wait_avg_s"], labels: ["avg wait"], router: true, fmt: (v) => `${v.toFixed(2)} s` },
+    { title: "Router requests", metrics: ["router.total_requests"], labels: ["completed + failed"], router: true, fmt: (v) => v.toFixed(0) },
+    { title: "Backend model memory", metrics: [], labels: [], dynamic: "backends", router: true, fmt: (v) => `${v.toFixed(1)} GB` },
   ];
 
   async function build() {
     const d = await api(`/api/devices/${id}/latest`);
+    // Panels and sections for sources this device doesn't have are hidden
+    // entirely (no placeholder labels) — the device simply doesn't run them.
+    const visiblePanels = panels.filter((p) => {
+      if (p.macmon && !d.has_macmon) return false;
+      if (p.hostmon && !d.has_hostmon) return false;
+      if (p.omlx && !d.has_omlx) return false;
+      if (p.comfy && !d.has_comfyui) return false;
+      if (p.router && !d.has_router) return false;
+      if (p.sysmem && !(d.has_omlx || d.has_macmon)) return false;
+      return true;
+    });
     const head = `
       <div class="detail-head">
         <a class="back" href="#">&larr; all devices</a>
@@ -762,32 +901,47 @@ async function renderDetail(id, initialRange = "1h") {
           .map((r) => `<button data-r="${r}" class="${r === range ? "active" : ""}">${r}</button>`)
           .join("")}</div>
       </div>
-      <div class="stat-cards" id="big"></div>
-      <div class="panel speed-panel">
+      ${d.has_omlx || d.has_macmon ? `<div class="stat-cards" id="big"></div>` : ""}
+      ${d.has_omlx ? `<div class="panel speed-panel">
         <div class="panel-head">${icon("zap")}<span class="kicker">Throughput</span></div>
         <div class="speed-grid">
           <div><span class="kicker">prefill</span><span class="speed-val" id="sp-pre"></span></div>
           <div><span class="kicker">generation</span><span class="speed-val" id="sp-gen"></span></div>
         </div>
-      </div>
+      </div>` : ""}
       <div class="live-groups" id="live"></div>
       <div class="panels" id="panels"></div>
-      <div class="panel wide" style="margin-top:14px">
+      ${d.has_omlx ? `<div class="panel wide" style="margin-top:14px">
         <div class="panel-head">${icon("box")}<span class="kicker">Loaded models</span></div>
         <div class="panel-body" id="models-table"></div>
       </div>
       <div class="panel wide" style="margin-top:14px">
         <div class="panel-head">${icon("database")}<span class="kicker">Available models</span></div>
         <div class="panel-body" id="avail-models"></div>
-      </div>
+      </div>` : ""}
       ${d.has_hostmon ? `<div class="panel wide" style="margin-top:14px">
         <div class="panel-head">${icon("activity")}<span class="kicker">Top processes by memory</span></div>
         <div class="panel-body" id="top-procs"></div>
+      </div>` : ""}
+      ${d.has_router ? `<div class="panel wide" style="margin-top:14px">
+        <div class="panel-head">${icon("globe")}<span class="kicker">Router backends</span><span class="head-right" id="router-note"></span></div>
+        <div class="panel-body" id="router-backends"></div>
+      </div>
+      <div class="panel wide" style="margin-top:14px">
+        <div class="panel-head">${icon("layers")}<span class="kicker">Recent routed requests</span></div>
+        <div class="panel-body" id="route-events"></div>
       </div>` : ""}`;
     view.innerHTML = head;
-    view.querySelector("#big").innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
-    const liveGroups = [...LIVE_GROUPS];
-    if (d.has_comfyui) liveGroups.splice(1, 0, COMFY_GROUP);
+    const bigEl = view.querySelector("#big");
+    if (bigEl) bigEl.innerHTML = BIG_STATS.map(([key, label]) => bigStat(key, label)).join("");
+    const liveGroups = LIVE_GROUPS.filter(([title]) => {
+      if (title === "inference") return !!d.has_omlx;
+      if (title === "memory") return !!(d.has_omlx || d.has_macmon || d.has_hostmon);
+      return true;
+    });
+    let groupAt = 1;
+    if (d.has_comfyui) liveGroups.splice(groupAt++, 0, COMFY_GROUP);
+    if (d.has_router) liveGroups.splice(groupAt, 0, ROUTER_GROUP);
     view.querySelector("#live").innerHTML = liveGroups.map(([title, iconName, stats]) =>
       `<div class="panel live-group"><div class="panel-head">${icon(iconName)}<span class="kicker">${title}</span></div><div class="live-group-body">${stats.map(([label]) => stat(label, "")).join("")}</div></div>`
     ).join("");
@@ -806,23 +960,19 @@ async function renderDetail(id, initialRange = "1h") {
     const statsEls = {};
     const projEls = {};
     const panelsDiv = view.querySelector("#panels");
-    for (const p of panels) {
+    for (const p of visiblePanels) {
       const div = document.createElement("div");
       div.className = "panel";
-      let right = "";
-      if (d.has_omlx === false && p.omlx) right = `<span class="head-right">no oMLX</span>`;
-      else if (d.has_comfyui === false && p.comfy) right = `<span class="head-right">no ComfyUI</span>`;
-      else if (d.has_hostmon === false && p.hostmon) right = `<span class="head-right">no hostmon</span>`;
-      else if (p.projection) right = `<span class="head-right"></span>`;
+      const right = p.projection ? `<span class="head-right"></span>` : "";
       div.innerHTML = `<div class="panel-head">${panelIcon(p.title)}<span class="kicker">${p.title}</span>${right}</div><div class="panel-body"><canvas></canvas><div class="chart-stats"></div></div>`;
       panelsDiv.appendChild(div);
       charts[p.title] = new Chart(div.querySelector("canvas"), { fmt: p.fmt, ymax: p.ymax });
       liveCharts.push(charts[p.title]);
       statsEls[p.title] = div.querySelector(".chart-stats");
-      if (p.projection && d.has_hostmon !== false) projEls[p.title] = div.querySelector(".head-right");
+      if (p.projection) projEls[p.title] = div.querySelector(".head-right");
     }
 
-    return { d, charts, statsEls, projEls, groups: liveGroups };
+    return { d, charts, statsEls, projEls, groups: liveGroups, panels: visiblePanels };
   }
 
   let ctx;
@@ -911,6 +1061,29 @@ async function renderDetail(id, initialRange = "1h") {
           procs.innerHTML = html;
         }
       }
+
+      const backends = view.querySelector("#router-backends");
+      if (backends) {
+        const html = backendsHTML(d);
+        if (html !== lastBackendsHTML) {
+          lastBackendsHTML = html;
+          backends.innerHTML = html;
+        }
+        const note = view.querySelector("#router-note");
+        if (note) note.textContent = d.router_auth_ok === false ? "admin key rejected" : "";
+      }
+
+      const events = view.querySelector("#route-events");
+      if (events) {
+        try {
+          const r = await api(`/api/devices/${id}/route-events?limit=50`);
+          const html = routeEventsHTML(r.events);
+          if (html !== lastEventsHTML) {
+            lastEventsHTML = html;
+            events.innerHTML = html;
+          }
+        } catch { /* events panel keeps its last render */ }
+      }
     } catch {
       // keep previous values on transient error
     }
@@ -926,21 +1099,42 @@ async function renderDetail(id, initialRange = "1h") {
         if (name) modelMetrics.push([`llm.model.${slug(name)}.mem_gb`, shortName(name)]);
       }
     }
+    // router deployments/backends come and go with the router's config, so
+    // their series keys are derived from the latest state, not hardcoded
+    const depMetrics = [];
+    const deps = d?.raw?.router?.models?.deployments;
+    if (deps && typeof deps === "object") {
+      for (const name of Object.keys(deps)) {
+        depMetrics.push([`router.dep.${slug(name)}.active`, name]);
+      }
+    }
+    const backendMetrics = [];
+    const back = d?.raw?.router?.ready?.backends;
+    if (back && typeof back === "object") {
+      for (const name of Object.keys(back)) {
+        backendMetrics.push([`router.backend.${slug(name)}.model_mem_gb`, name]);
+      }
+    }
     const wanted = new Set();
-    for (const p of panels) {
+    for (const p of ctx.panels) {
       p.metrics.forEach((m) => wanted.add(m));
       if (p.pressureSeries) wanted.add(p.pressureSeries);
       if (p.dynamic === "models") modelMetrics.forEach(([m]) => wanted.add(m));
+      if (p.dynamic === "deployments") depMetrics.forEach(([m]) => wanted.add(m));
+      if (p.dynamic === "backends") backendMetrics.forEach(([m]) => wanted.add(m));
     }
     const all = [...wanted];
-    const h = await api(`/api/devices/${id}/history?metrics=${all.join(",")}&range=${range}`);
-    const series = h.series;
-    const bands = h.bands || {};
+    let series = {}, bands = {};
+    if (all.length) {
+      const h = await api(`/api/devices/${id}/history?metrics=${all.join(",")}&range=${range}`);
+      series = h.series;
+      bands = h.bands || {};
+    }
     const scaleBand = (b, mul) => (b == null ? null : {
       min: b.min.map(([t, v]) => [t, v * mul]),
       max: b.max.map(([t, v]) => [t, v * mul]),
     });
-    for (const p of panels) {
+    for (const p of ctx.panels) {
       const mul = p.pct ? 100 : 1;
       const list = p.metrics.map((m, i) => {
         const s = {
@@ -953,6 +1147,16 @@ async function renderDetail(id, initialRange = "1h") {
       });
       if (p.dynamic === "models") {
         for (const [m, label] of modelMetrics) {
+          list.push({ label, data: series[m] || [] });
+        }
+      }
+      if (p.dynamic === "deployments") {
+        for (const [m, label] of depMetrics) {
+          list.push({ label, data: series[m] || [] });
+        }
+      }
+      if (p.dynamic === "backends") {
+        for (const [m, label] of backendMetrics) {
           list.push({ label, data: series[m] || [] });
         }
       }

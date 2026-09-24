@@ -18,6 +18,8 @@ from hub.poll import (
     extract_hostmon,
     extract_model_series,
     extract_omlx_stats,
+    extract_router_admin,
+    extract_router_ready,
     extract_system,
 )
 
@@ -100,6 +102,85 @@ HOSTMON_PAYLOAD = {
     "net_rx_Bps": 2.5e6,
     "net_tx_Bps": 1.25e6,
     "top_rss_procs": [["omlx", 18342.4], ["WindowServer", 938.1]],
+}
+
+# omlx-router /ready (port 8000). Returns 200 when status=="ready", 503 with
+# the same body shape when status=="not_ready" — both carry full backends.
+ROUTER_READY = {
+    "status": "ready",
+    "backends": {
+        "studio": {
+            "healthy": True,
+            "models": ["Qwen3.8-27B-bf16"],
+            "model_context_tokens": {"Qwen3.8-27B-bf16": 131072},
+            "default_model": "Qwen3.8-27B-bf16",
+            "engine_pool": {
+                "loaded_model_count": 1,
+                "model_memory_bytes": 32 * 1024**3,
+                "memory_ceiling_bytes": 96 * 1024**3,
+                "memory_headroom_bytes": 64 * 1024**3,
+            },
+            "detail": None,
+        },
+        "laptop": {
+            "healthy": False,
+            "models": [],
+            "model_context_tokens": {},
+            "default_model": None,
+            "engine_pool": {
+                "loaded_model_count": 0,
+                "model_memory_bytes": 0,
+                "memory_ceiling_bytes": 32 * 1024**3,
+                "memory_headroom_bytes": 32 * 1024**3,
+            },
+            "detail": "connect_error",
+        },
+    },
+}
+
+# omlx-router /admin/api/stats (Bearer-protected). Only the keys we extract.
+ROUTER_STATS = {
+    "workload": {"active": 2, "completed": 1432, "failed": 8},
+    "wait_metrics": {"avg": 1.4},
+}
+
+# omlx-router /admin/api/models (Bearer-protected). Only the keys we extract.
+ROUTER_MODELS = {
+    "profiles": {},
+    "deployments": {
+        "auto-quality": {
+            "backend": "studio",
+            "upstream_model": "Qwen3.8-27B-bf16",
+            "readiness": "busy",
+            "active_requests": 1,
+        },
+        "auto-cheap": {
+            "backend": "laptop",
+            "upstream_model": "Qwen3.8-4B",
+            "readiness": "unresponsive",
+            "active_requests": 1,
+        },
+    },
+}
+
+# omlx-router /admin/api/requests rows (newest-first).
+ROUTER_REQUESTS = {
+    "data": [
+        {
+            "request_id": "req-2",
+            "recorded_at": 1757548900.0,
+            "model": "auto",
+            "deployment": "auto-quality",
+            "status": 200,
+        },
+        {
+            "request_id": "req-1",
+            "recorded_at": 1757548800.0,
+            "model": "auto",
+            "deployment": "auto-cheap",
+            "status": 200,
+        },
+    ]
 }
 
 
@@ -278,6 +359,44 @@ class TestExtractModelSeries:
         assert extract_model_series([{"no_id": True}, 42, None]) == {}
 
 
+class TestExtractRouter:
+    def test_ready_full_payload(self):
+        m = extract_router_ready(ROUTER_READY)
+        assert m["router.status_ready"] == 1.0
+        assert m["router.backends_healthy"] == 1.0
+        assert m["router.backend.studio.healthy"] == 1.0
+        assert m["router.backend.laptop.healthy"] == 0.0
+        assert m["router.backend.studio.model_mem_gb"] == pytest.approx(32.0)
+        assert m["router.backend.studio.mem_headroom_gb"] == pytest.approx(64.0)
+        assert m["router.backend.studio.loaded_models"] == 1.0
+        # Offline backend still has an engine_pool — headroom = ceiling.
+        assert m["router.backend.laptop.mem_headroom_gb"] == pytest.approx(32.0)
+
+    def test_ready_not_ready_clears_status(self):
+        not_ready = {**ROUTER_READY, "status": "not_ready"}
+        m = extract_router_ready(not_ready)
+        assert m["router.status_ready"] == 0.0
+        # Backend series still extract — a "not_ready" router is up.
+        assert m["router.backend.studio.healthy"] == 1.0
+
+    def test_ready_garbage_returns_empty(self):
+        assert extract_router_ready({}) == {}
+        assert extract_router_ready({"backends": {}}) == {}
+
+    def test_admin_full_payload(self):
+        m = extract_router_admin(ROUTER_STATS, ROUTER_MODELS)
+        assert m["router.inflight"] == 2.0
+        assert m["router.total_requests"] == 1440.0  # 1432 + 8
+        assert m["router.wait_avg_s"] == pytest.approx(1.4)
+        assert m["router.dep.auto-quality.active"] == 1.0
+        assert m["router.dep.auto-cheap.active"] == 1.0
+
+    def test_admin_missing_sections(self):
+        assert extract_router_admin({}, {}) == {}
+        m = extract_router_admin({"workload": {"active": 3}}, {"deployments": {}})
+        assert m == {"router.inflight": 3.0}
+
+
 class TestStore:
     def _store(self, **kw):
         return Store.in_memory(Retention(full_res_hours=1, rollup_days=30, rollup_seconds=300, **kw))
@@ -393,6 +512,47 @@ class TestStore:
         assert bands["x"]["min"] and bands["x"]["max"]
         s.close()
 
+    def test_route_events_dedupe_and_order(self):
+        s = self._store()
+        rows = list(ROUTER_REQUESTS["data"])
+        assert s.insert_events("dev", rows) == 2
+        s.commit()
+        # Same (device, ts, request_id) rows are idempotent no-ops — a retick
+        # that re-drains the same window inserts nothing.
+        assert s.insert_events("dev", rows) == 0
+        recent = s.recent_events("dev", 10)
+        assert [e["request_id"] for e in recent] == ["req-2", "req-1"]  # newest first
+        assert recent[0]["deployment"] == "auto-quality"
+        s.close()
+
+    def test_route_events_limit_and_empty_devices(self):
+        s = self._store()
+        assert s.recent_events("ghost", 5) == []
+        s.insert_events("dev", ROUTER_REQUESTS["data"])
+        s.commit()
+        assert len(s.recent_events("dev", 1)) == 1
+        s.close()
+
+    def test_route_events_skip_rows_missing_keys(self):
+        s = self._store()
+        assert s.insert_events("dev", [{"no_request_id": 1}, {"request_id": "x"}]) == 0
+        s.commit()
+        assert s.recent_events("dev", 5) == []
+        s.close()
+
+    def test_route_events_pruned_by_route_event_days(self):
+        s = self._store(route_event_days=7)
+        now = time.time()
+        old = {"request_id": "old", "recorded_at": now - 8 * 86400}
+        fresh = {"request_id": "fresh", "recorded_at": now - 6 * 86400}
+        s.insert_events("dev", [old, fresh])
+        s.commit()
+        stats = s.rollup_and_prune(now=now)
+        assert stats["events_pruned"] == 1
+        remaining = [e["request_id"] for e in s.recent_events("dev", 10)]
+        assert remaining == ["fresh"]
+        s.close()
+
 
 class TestConfig:
     def test_load(self, tmp_path):
@@ -493,6 +653,23 @@ macmon_port = 9091
         legacy, both = cfg.devices
         assert legacy.host_port == 9091
         assert both.host_port == 9092  # host_port wins over the alias
+
+    def test_router_opt_in(self, tmp_path):
+        # Router is opt-in like comfyui/hostmon: omitted (or 0) must disable
+        # it, an explicit port enables it. The Bearer key shares api_key.
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "No Router"\nhost = "a"\n'
+            '[[devices]]\nname = "Router"\nhost = "b"\nrouter_port = 8100\napi_key = "rk"\n'
+            '[[devices]]\nname = "Off"\nhost = "c"\nrouter_port = 0\n'
+            '[retention]\nroute_event_days = 3\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        no_router, router, off = cfg.devices
+        assert no_router.router_port is None and no_router.router_url is None
+        assert router.router_url == "http://b:8100"
+        assert router.api_key == "rk"
+        assert off.router_port == 0 and off.router_url is None
+        assert cfg.retention.route_event_days == 3
 
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
@@ -643,6 +820,140 @@ class TestPoller:
         assert state.host_ok is True
         assert state.system["sys.disk_used_pct"] == pytest.approx(0.5)
         assert state.public()["host_ok"] is True
+        store.close()
+
+    async def test_router_success_with_key(self):
+        seen_auth = []
+
+        def handler(request):
+            if request.url.port != 8100:
+                return httpx.Response(404)
+            seen_auth.append(request.headers.get("authorization"))
+            if request.url.path == "/ready":
+                return httpx.Response(200, json=ROUTER_READY)
+            if request.url.path == "/admin/api/stats":
+                return httpx.Response(200, json=ROUTER_STATS)
+            if request.url.path == "/admin/api/models":
+                return httpx.Response(200, json=ROUTER_MODELS)
+            if request.url.path == "/admin/api/requests":
+                return httpx.Response(200, json=ROUTER_REQUESTS)
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None,
+            router_port=8100, api_key="rk",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert state.router_ok is None
+        assert await poller._tick_fast() is True
+        assert state.router_ok is True
+        assert state.router_auth_ok is True
+        assert state.public()["router_ok"] is True
+        assert state.public()["has_router"] is True
+        assert state.public()["router_admin_url"] == "http://h:8100/dashboard"
+        # /ready must NOT see the Bearer header (public endpoint), admin must.
+        assert seen_auth[0] is None
+        assert "Bearer rk" in seen_auth[1:]
+        assert state.raw["router"]["ready"] == ROUTER_READY
+        store.commit()
+        h = store.history("t", ["router.inflight"], time.time() - 10, time.time() + 1)
+        assert h["router.inflight"][-1][1] == 2.0
+        # Events were drained into the store on the same tick.
+        assert [e["request_id"] for e in store.recent_events("t", 10)] == ["req-2", "req-1"]
+        store.close()
+
+    async def test_router_503_still_ok(self):
+        def handler(request):
+            if request.url.path == "/ready":
+                not_ready = {**ROUTER_READY, "status": "not_ready"}
+                return httpx.Response(503, json=not_ready)
+            return httpx.Response(404)
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=None, router_port=8100)
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert state.router_ok is True
+        assert state.online
+        store.commit()
+        h = store.history("t", ["router.status_ready"], time.time() - 10, time.time() + 1)
+        assert h["router.status_ready"][-1][1] == 0.0
+        store.close()
+
+    async def test_router_401_keeps_ready_series(self):
+        def handler(request):
+            if request.url.path == "/ready":
+                return httpx.Response(200, json=ROUTER_READY)
+            if request.url.path.startswith("/admin/"):
+                return httpx.Response(401, json={"error": {"type": "authentication_error"}})
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None,
+            router_port=8100, api_key="wrong",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert state.router_ok is True
+        assert state.router_auth_ok is False
+        # Ready series still land; admin-only series do not.
+        store.commit()
+        h = store.history("t", ["router.status_ready", "router.inflight"],
+                          time.time() - 10, time.time() + 1)
+        assert h["router.status_ready"]
+        assert h["router.inflight"] == []
+        assert store.recent_events("t", 5) == []
+        store.close()
+
+    async def test_router_failure_tracked_per_source(self):
+        # Router down must not take a multi-source device offline.
+        fail = {"router": False}
+
+        def handler(request):
+            if request.url.port == 8100:
+                if fail["router"]:
+                    raise httpx.ConnectError("connection refused")
+                return httpx.Response(200, json=ROUTER_READY)
+            return httpx.Response(200, json=MACMON_PAYLOAD)
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=9090, router_port=8100)
+        poller, state, store = self._poller(handler, dev)
+        assert state.router_ok is None
+
+        fail["router"] = True
+        assert await poller._tick_fast() is True
+        assert state.online  # macmon still serving
+        assert state.router_ok is False
+        assert state.public()["router_ok"] is False
+
+        fail["router"] = False
+        # Router polls are throttled to models_interval; step past it as the
+        # real clock would, so the recovery tick actually polls.
+        poller._router_last_poll = 0
+        assert await poller._tick_fast() is True
+        assert state.router_ok is True
+        assert "router" in state.raw
+        store.close()
+
+    async def test_router_tick_throttled(self):
+        # Between throttled ticks the router must return the previous state so
+        # a router-only device doesn't flap offline.
+        calls = {"ready": 0}
+
+        def handler(request):
+            if request.url.path == "/ready":
+                calls["ready"] += 1
+                return httpx.Response(200, json=ROUTER_READY)
+            return httpx.Response(404)
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=None, router_port=8100)
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert calls["ready"] == 1
+        # Immediate retick: throttled → returns cached True, no HTTP call,
+        # device stays online.
+        assert await poller._tick_fast() is True
+        assert calls["ready"] == 1
+        assert state.online
         store.close()
 
     async def test_models_tick_unwraps_payload_for_frontend(self):
@@ -1017,6 +1328,24 @@ class TestApi:
             assert client.get(base + "&from_ts=200&to_ts=100").status_code == 400
             assert client.get(base + "&from_ts=100&to_ts=100").status_code == 400
             assert client.get(base + "&from_ts=nan&to_ts=200").status_code == 400
+        store.close()
+
+    def test_route_events_endpoint(self):
+        client, store = self._client()
+        store.insert_events("studio-one", ROUTER_REQUESTS["data"])
+        store.commit()
+        with client:
+            r = client.get("/api/devices/studio-one/route-events")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["device"] == "studio-one"
+            assert [e["request_id"] for e in body["events"]] == ["req-2", "req-1"]
+            assert client.get("/api/devices/ghost/route-events").status_code == 404
+            # limit is clamped to 1..200 by the query schema
+            assert client.get("/api/devices/studio-one/route-events?limit=0").status_code == 422
+            assert client.get("/api/devices/studio-one/route-events?limit=201").status_code == 422
+            r = client.get("/api/devices/studio-one/route-events?limit=1")
+            assert len(r.json()["events"]) == 1
         store.close()
 
     def test_history_7d_includes_recent_samples(self):

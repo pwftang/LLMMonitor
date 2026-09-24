@@ -37,6 +37,15 @@ CREATE TABLE IF NOT EXISTS rollups (
     PRIMARY KEY (device, bucket_ts, metric)
 );
 CREATE INDEX IF NOT EXISTS idx_rollups_lookup ON rollups (device, metric, bucket_ts);
+
+CREATE TABLE IF NOT EXISTS route_events (
+    device     TEXT NOT NULL,
+    ts         REAL NOT NULL,
+    request_id TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    UNIQUE (device, ts, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_route_events_dev_ts ON route_events (device, ts);
 """
 
 
@@ -67,16 +76,47 @@ class Store:
         with self._lock:
             self._conn.commit()
 
+    def insert_events(self, device: str, records: Iterable[dict]) -> int:
+        """Add router request events. Dedupe is by (device, ts, request_id):
+        ts is the router's own recorded_at, so a repeated drain insert is a
+        no-op while a colliding request_id at a different ts still lands."""
+        rows = []
+        for rec in records:
+            rid = rec.get("request_id")
+            ts = rec.get("recorded_at")
+            if rid is None or ts is None:
+                continue
+            rows.append((device, float(ts), str(rid), json.dumps(rec)))
+        if not rows:
+            return 0
+        with self._lock:
+            cur = self._conn.executemany(
+                "INSERT OR IGNORE INTO route_events (device, ts, request_id, payload) "
+                "VALUES (?, ?, ?, ?)",
+                rows,
+            )
+            return cur.rowcount
+
+    def recent_events(self, device: str, limit: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload FROM route_events WHERE device = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (device, limit),
+            ).fetchall()
+        return [json.loads(payload) for (payload,) in rows]
+
     def rollup_and_prune(self, now: float | None = None) -> dict:
         """Fold raw samples older than the full-res window into buckets."""
         now = now or time.time()
         r = self.retention
         full_res_cutoff = now - r.full_res_hours * 3600
         rollup_cutoff = now - r.rollup_days * 86400
+        events_cutoff = now - r.route_event_days * 86400
         # Only buckets fully inside the past-full-res region are rolled up.
         horizon_bucket = int(full_res_cutoff // r.rollup_seconds) * r.rollup_seconds
 
-        rolled = pruned_samples = pruned_rollups = 0
+        rolled = pruned_samples = pruned_rollups = pruned_events = 0
         with self._lock:
             devices = [
                 row[0] for row in self._conn.execute("SELECT DISTINCT device FROM samples")
@@ -103,11 +143,16 @@ class Store:
                 "DELETE FROM rollups WHERE bucket_ts < ?", (int(rollup_cutoff),)
             )
             pruned_rollups = cur.rowcount
+            cur = self._conn.execute(
+                "DELETE FROM route_events WHERE ts < ?", (events_cutoff,)
+            )
+            pruned_events = cur.rowcount
             self._conn.commit()
         return {
             "rollups_written": rolled,
             "samples_pruned": pruned_samples,
             "rollups_pruned": pruned_rollups,
+            "events_pruned": pruned_events,
         }
 
     def history(

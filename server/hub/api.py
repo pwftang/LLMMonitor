@@ -104,6 +104,15 @@ def create_app(cfg: Config, store: Store, states: dict[str, DeviceState], *, sta
         data, bands = store.history_with_bands(dev_id, metric_list, from_ts, to_ts)
         return JSONResponse({"device": dev_id, "from": from_ts, "to": to_ts, "series": data, "bands": bands})
 
+    @app.get("/api/devices/{dev_id}/route-events")
+    async def device_route_events(
+        dev_id: str,
+        limit: int = Query(50, ge=1, le=200),
+    ) -> JSONResponse:
+        if dev_id not in states:
+            raise HTTPException(404, f"unknown device: {dev_id}")
+        return JSONResponse({"device": dev_id, "events": store.recent_events(dev_id, limit)})
+
     web_dir = cfg.web_dir or cfg.default_web_dir()
     index = Path(web_dir) / "index.html"
     if index.exists():

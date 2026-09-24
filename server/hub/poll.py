@@ -200,6 +200,88 @@ def extract_model_series(models: list | dict) -> dict[str, float]:
     return out
 
 
+# ---- omlx-router extraction ----------------------------------------------------
+
+def extract_router_ready(p: dict) -> dict[str, float]:
+    """Router /ready payload → router.* series.
+
+    /ready returns 200 with status="ready" OR 503 with status="not_ready" —
+    both carry the full backends map, so treat *any* well-formed body as a
+    healthy poll: the router is "up" even when no backend is currently
+    routable. Callers must NOT raise_for_status on this endpoint.
+    """
+    out: dict[str, float] = {}
+    status = p.get("status")
+    if not isinstance(status, str):
+        return out
+    out["router.status_ready"] = 1.0 if status == "ready" else 0.0
+    backends = p.get("backends")
+    healthy_n = 0
+    if isinstance(backends, dict):
+        for name, b in backends.items():
+            if not isinstance(b, dict):
+                continue
+            slug = _slug(name)
+            if not slug:
+                continue
+            healthy = 1.0 if b.get("healthy") else 0.0
+            healthy_n += int(healthy)
+            out[f"router.backend.{slug}.healthy"] = healthy
+            ep = b.get("engine_pool")
+            if isinstance(ep, dict):
+                mem = ep.get("model_memory_bytes")
+                if isinstance(mem, (int, float)):
+                    out[f"router.backend.{slug}.model_mem_gb"] = _gb(mem)
+                head = ep.get("memory_headroom_bytes")
+                if isinstance(head, (int, float)):
+                    out[f"router.backend.{slug}.mem_headroom_gb"] = _gb(head)
+                loaded = ep.get("loaded_model_count")
+                if isinstance(loaded, (int, float)):
+                    out[f"router.backend.{slug}.loaded_models"] = float(loaded)
+    out["router.backends_healthy"] = float(healthy_n)
+    return out
+
+
+def extract_router_admin(stats: dict, models: dict) -> dict[str, float]:
+    """Router /admin/api/stats + /admin/api/models → router.* series.
+
+    These endpoints require the router's Bearer key; absent the key (or a
+    401) the caller simply skips this extractor entirely.
+    """
+    out: dict[str, float] = {}
+    workload = stats.get("workload")
+    total_requests = 0
+    if isinstance(workload, dict):
+        active = workload.get("active")
+        if isinstance(active, (int, float)):
+            out["router.inflight"] = float(active)
+        completed = workload.get("completed")
+        if isinstance(completed, (int, float)):
+            total_requests += int(completed)
+        failed = workload.get("failed")
+        if isinstance(failed, (int, float)):
+            total_requests += int(failed)
+    if total_requests:
+        out["router.total_requests"] = float(total_requests)
+    wait = stats.get("wait_metrics")
+    if isinstance(wait, dict):
+        avg = wait.get("avg") or wait.get("mean") or wait.get("avg_wait_s")
+        if isinstance(avg, (int, float)):
+            out["router.wait_avg_s"] = float(avg)
+    deps = models.get("deployments")
+    if isinstance(deps, dict):
+        for name, d in deps.items():
+            if not isinstance(d, dict):
+                continue
+            slug = _slug(name)
+            if not slug:
+                continue
+            active = d.get("active_requests")
+            if isinstance(active, (int, float)):
+                out[f"router.dep.{slug}.active"] = float(active)
+    return out
+
+
 def extract_comfyui(queue: dict, stats: dict) -> dict[str, float]:
     """ComfyUI /queue + /system_stats payloads → comfyui.* series.
 
@@ -240,6 +322,8 @@ class DeviceState:
         self.macmon_last_ok: float | None = None
         self.comfy_ok: bool | None = None
         self.host_ok: bool | None = None
+        self.router_ok: bool | None = None
+        self.router_auth_ok: bool | None = None
         # Live render progress pushed by the ComfyUI /ws watch loop:
         # {"step", "total", "node", "started_at", "elapsed_s"} while running.
         self.comfy_progress: dict[str, Any] | None = None
@@ -268,6 +352,10 @@ class DeviceState:
             "has_hostmon": self.device.hostmon_url is not None,
             "host_ok": self.host_ok,
             "comfy_ok": self.comfy_ok,
+            "has_router": self.device.router_url is not None,
+            "router_ok": self.router_ok,
+            "router_auth_ok": self.router_auth_ok,
+            "router_admin_url": f"{self.device.router_url}/dashboard" if self.device.router_url else None,
             "omlx_admin_url": f"{base}/admin" if base else None,
             "tailscale_ip": self.tailscale_ip,
             "local_ip": self.local_ip,
@@ -303,6 +391,9 @@ class DevicePoller:
         # Wallclock the REST queue first reported a running job — the fallback
         # progress clock for jobs whose nodes never emit WS progress frames.
         self._comfy_run_since: float | None = None
+        # Router is throttled inside the fast loop (no dedicated loop — the
+        # fast loop is the only one guaranteed to run on every device).
+        self._router_last_poll: float = 0.0
 
     async def run(self) -> None:
         log.info("poller started for %s", self.device.id)
@@ -386,13 +477,16 @@ class DevicePoller:
             ok |= await self._tick_comfyui()
         if self.device.hostmon_url:
             ok |= await self._tick_hostmon()
+        if self.device.router_url:
+            ok |= await self._tick_router()
         if ok:
             self.state.mark_ok()
         else:
             self.state.mark_offline("unreachable")
-            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s hostmon=%s)",
+            log.warning("%s unreachable (macmon=%s omlx=%s comfyui=%s hostmon=%s router=%s)",
                         self.device.id, self.device.macmon_url, self.device.omlx_base,
-                        self.device.comfyui_base, self.device.hostmon_url)
+                        self.device.comfyui_base, self.device.hostmon_url,
+                        self.device.router_url)
         return ok
 
     async def _tick_macmon(self) -> bool:
@@ -445,6 +539,100 @@ class DevicePoller:
         self.state.raw["hostmon"] = payload
         self.store.insert(self.device.id, time.time(), "system", series)
         return True
+
+    async def _tick_router(self) -> bool:
+        """Poll omlx-router /ready (public, 200 OR 503-with-body both healthy).
+
+        Called from _fast_loop but throttled to cfg.models_interval: router
+        state evolves slower than macmon's per-tick system metrics, and the
+        admin endpoints are heavier. Throttled ticks return the previous
+        router_ok so the `ok |=` accumulation in _fast_loop doesn't flap.
+        """
+        assert self._client is not None and self.device.router_url is not None
+        now = time.monotonic()
+        if now - self._router_last_poll < self.cfg.models_interval:
+            return bool(self.state.router_ok)
+        self._router_last_poll = now
+        was_ok = self.state.router_ok
+        try:
+            r = await self._router_get("/ready", auth=False, raise_on_status=False)
+            ready_body = r.json()
+            if not isinstance(ready_body, dict):
+                raise ValueError("router /ready returned non-object payload")
+        except Exception as e:  # noqa: BLE001
+            if was_ok is not False:
+                log.warning("%s router unreachable: %s", self.device.id, e)
+            self.state.router_ok = False
+            self.state.router_auth_ok = None
+            self.state.raw.pop("router", None)
+            return False
+        if was_ok is False:
+            log.info("%s router recovered", self.device.id)
+        self.state.router_ok = True
+        series = extract_router_ready(ready_body)
+        stats_body: dict | None = None
+        models_body: dict | None = None
+        if self.device.api_key:
+            try:
+                stats_r, models_r = await asyncio.gather(
+                    self._router_get("/admin/api/stats"),
+                    self._router_get("/admin/api/models"),
+                )
+                stats_body, models_body = stats_r.json(), models_r.json()
+                if not isinstance(stats_body, dict) or not isinstance(models_body, dict):
+                    raise ValueError("router admin api returned non-object payload")
+                self.state.router_auth_ok = True
+            except Exception as e:  # noqa: BLE001
+                # 401 (bad key) or any admin failure: keep /ready series, drop
+                # the dep/inflight/req series, and mark auth broken so the UI
+                # can say "key needed" without declaring the router offline.
+                self.state.router_auth_ok = False
+                stats_body = models_body = None
+                log.warning("%s router admin api failed: %s", self.device.id, e)
+        else:
+            self.state.router_auth_ok = None
+        if stats_body is not None and models_body is not None:
+            series.update(extract_router_admin(stats_body, models_body))
+        self.state.raw["router"] = {
+            "ready": ready_body,
+            "stats": stats_body,
+            "models": models_body,
+        }
+        self.store.insert(self.device.id, time.time(), "router", series)
+        if self.device.api_key and stats_body is not None:
+            try:
+                req_r = await self._router_get("/admin/api/requests", params={"limit": 100})
+                req_body = req_r.json()
+                if isinstance(req_body, dict):
+                    rows = req_body.get("data")
+                    if isinstance(rows, list):
+                        self.store.insert_events(
+                            self.device.id, [r for r in rows if isinstance(r, dict)]
+                        )
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s router recent-requests drain failed: %s", self.device.id, e)
+        return True
+
+    async def _router_get(
+        self,
+        path: str,
+        *,
+        auth: bool = True,
+        raise_on_status: bool = True,
+        params: dict | None = None,
+    ) -> httpx.Response:
+        """GET against the router. Bearer header uses device.api_key verbatim —
+        that key is router-only by design (omlx and comfyui use their own
+        login flows), so there's no header collision on a dual-purpose box."""
+        assert self._client is not None and self.device.router_url is not None
+        url = self.device.router_url + path
+        headers = {}
+        if auth and self.device.api_key:
+            headers["Authorization"] = f"Bearer {self.device.api_key}"
+        r = await self._client.get(url, headers=headers, params=params)
+        if raise_on_status:
+            r.raise_for_status()
+        return r
 
     async def _tick_comfyui(self) -> bool:
         assert self._client is not None and self.device.comfyui_base is not None

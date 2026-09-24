@@ -9,7 +9,11 @@ The drill-down also covers memory pressure (RAM charts are coloured by it),
 swap, clock speeds, a CPU/GPU/RAM/ANE power breakdown and disk usage with a
 "full in ~N days" projection. A tiny companion agent, hostmon, adds what
 macmon can't: disk free/used, the macOS memory-pressure level, uptime,
-network throughput and the top memory-hungry processes.
+network throughput and the top memory-hungry processes. Optionally, any
+device (Mac or not) running
+[omlx-router](https://github.com/pwftang/omlx-router) can be polled too:
+backend health, per-deployment in-flight requests, wait times and a log of
+recent routed requests.
 
 ## How it works
 
@@ -90,10 +94,35 @@ bind the tailnet IP — never `0.0.0.0`, especially on the MacBook.) Then add
 `comfyui_port = 8188` to that device's block in `hub.toml`. Nothing new runs on
 the Mac — the hub just polls the REST API ComfyUI already serves.
 
-> **Trust boundary:** the omlx admin port is key-protected by you; macmon,
-> hostmon and this hub are unauthenticated read-only endpoints. All rely on
-> the tailnet as the boundary — lock a Tailscale ACL to your own devices if
-> you want belt and braces.
+### omlx-router (optional, per device)
+
+A machine running [omlx-router](https://github.com/pwftang/omlx-router) —
+including one that runs nothing else, e.g. a Linux LXC — can be monitored as
+its own device. Add `router_port` to its `[[devices]]` block and set
+`api_key` to the router's Bearer key:
+
+```toml
+[[devices]]
+name = "Router LXC"
+host = "omlx-router.tailc08855.ts.net"
+omlx_port = 0
+macmon_port = 0
+router_port = 8000
+api_key = "your-router-bearer-key"
+```
+
+The hub polls the public `/ready` endpoint either way; the key unlocks the
+`/admin` half (per-deployment request counts, wait-time averages, and the
+routed-requests log). Requests are drained into the hub's SQLite and kept for
+`route_event_days` (default 7) in the `[retention]` table. Router panels
+appear only on devices where `router_port` is set; likewise every absent
+source's panels are hidden entirely.
+
+> **Trust boundary:** the omlx admin port is key-protected by you; the router's
+> `/admin` API is Bearer-protected by you; macmon, hostmon and this hub are
+> unauthenticated read-only endpoints. All rely on the tailnet as the
+> boundary — lock a Tailscale ACL to your own devices if you want belt and
+> braces.
 
 ## Run the hub
 
@@ -122,7 +151,9 @@ beside it by default (`data_dir`), so the volume is a complete backup.
 
 - `samples` — raw 2 s metrics, kept for `full_res_hours` (default 24 h)
 - `rollups` — 5-min min/avg/max per metric, kept for `rollup_days` (default 30 d)
-- A hourly background job folds samples into rollups and prunes both tables.
+- `route_events` — omlx-router request records, kept for `route_event_days`
+  (default 7 d); deduped per request, never rolled up
+- A hourly background job folds samples into rollups and prunes all three tables.
   History requests automatically use rollups for ranges beyond the full-res window.
 
 ## Tests
@@ -138,3 +169,5 @@ cd server && ../.venv/bin/python -m pytest -q
 - `GET /api/devices/{id}/latest`
 - `GET /api/devices/{id}/history?metrics=llm.gen_tps,sys.cpu_util&range=6h`
   (ranges: `1h 3h 6h 24h 7d 30d`, or explicit `from_ts`/`to_ts`)
+- `GET /api/devices/{id}/route-events?limit=50` — recent routed requests
+  (omlx-router devices; limit 1–200)

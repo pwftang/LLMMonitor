@@ -15,6 +15,7 @@ request_timeout = 5         # seconds per HTTP request
 full_res_hours = 24         # keep raw 2s samples this long
 rollup_days = 30            # keep 5-minute rollups this long
 rollup_seconds = 300        # rollup bucket size
+route_event_days = 7        # keep routed-request records (omlx-router) this long
 
 # One [[devices]] block per machine.
 # name      — display name
@@ -29,7 +30,11 @@ rollup_seconds = 300        # rollup bucket size
 #             the tiny host telemetry agent (disk usage, memory pressure, ...)
 #             installed by macos/install-hostmon-agent.sh. The old key
 #             disk_port is still accepted as an alias.
-# api_key   — omlx API key (omit if the server has no key configured)
+# router_port — omlx-router port (opt-in; omit or set 0 to disable). Adds router
+#             health/deployments charts and, with api_key set, a routed-requests
+#             log. Polls /ready (public) plus the Bearer-protected /admin API.
+# api_key   — omlx API key; on a router device it doubles as the router's
+#             Bearer key (omit if neither needs one)
 
 [[devices]]
 name = "Mac Studio M2 Ultra"
@@ -53,3 +58,14 @@ host = "pats-macbook-pro.tailc08855.ts.net"
 omlx_port = 8000
 macmon_port = 9090
 api_key = "your-omlx-api-key-here"
+
+# A machine that only runs omlx-router (e.g. a Linux LXC with no macmon/omlx):
+# disable the other sources and set api_key to the router's Bearer key to get
+# the deployments/in-flight stats and the routed-requests log.
+# [[devices]]
+# name = "Router LXC"
+# host = "omlx-router.tailc08855.ts.net"
+# omlx_port = 0
+# macmon_port = 0
+# router_port = 8000
+# api_key = "your-router-bearer-key-here"

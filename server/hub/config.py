@@ -22,6 +22,10 @@ class Device:
     # hostmon (macos/install-hostmon-agent.sh) is likewise opt-in; absent → no
     # host telemetry series for the device and the UI hides the indicators.
     host_port: int | None = None
+    # omlx-router (github.com/pwftang/omlx-router) is opt-in too; on a
+    # router-only device set 0 for the other ports and use api_key as the
+    # router's Bearer key.
+    router_port: int | None = None
     api_key: str | None = None
     # Optional stable id; defaults to a slug of `name`. Set explicitly so a
     # display-name change doesn't orphan this device's stored history.
@@ -55,12 +59,20 @@ class Device:
             return None
         return f"http://{self.host}:{self.host_port}/json"
 
+    @property
+    def router_url(self) -> str | None:
+        if not self.router_port:
+            return None
+        return f"http://{self.host}:{self.router_port}"
+
 
 @dataclass
 class Retention:
     full_res_hours: float = 24
     rollup_days: float = 30
     rollup_seconds: int = 300
+    # Router request-event rows are kept whole (never rolled up) this long.
+    route_event_days: float = 7
 
 
 @dataclass
@@ -130,6 +142,8 @@ def load(path: str | os.PathLike | None = None) -> Config:
             # disk_port is the pre-rename alias; kept so existing hub.toml
             # files keep working.
             host_port=d.get("host_port", d.get("disk_port")),
+            # Opt-in like comfyui_port: omitted (or 0) → no router polling.
+            router_port=d.get("router_port"),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )

@@ -271,6 +271,8 @@ a { color: var(--blue); text-decoration: none; }
   row-gap: 0;
 }
 .card.has-comfy { grid-row: span 6; }
+.card.has-router { grid-row: span 6; }
+.card.has-comfy.has-router { grid-row: span 7; }
 .card:hover { border-color: var(--muted); }
 .card.offline { opacity: 0.55; cursor: default; }
 
