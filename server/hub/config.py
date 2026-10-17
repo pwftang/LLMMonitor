@@ -23,9 +23,16 @@ class Device:
     # host telemetry series for the device and the UI hides the indicators.
     host_port: int | None = None
     # omlx-router (github.com/pwftang/omlx-router) is opt-in too; on a
-    # router-only device set 0 for the other ports and use api_key as the
-    # router's Bearer key.
+    # router-only device set 0 for the other ports.
     router_port: int | None = None
+    # Dedicated keys: never cross-sent. omlx calls use omlx_api_key, router
+    # calls use router_api_key.
+    omlx_api_key: str | None = None
+    router_api_key: str | None = None
+    # DEPRECATED fallback: on a single-service device api_key was both the
+    # omlx key and the router Bearer key. It still resolves for either
+    # service when the dedicated key is absent, but prefer the dedicated
+    # fields on dual-purpose devices.
     api_key: str | None = None
     # Optional stable id; defaults to a slug of `name`. Set explicitly so a
     # display-name change doesn't orphan this device's stored history.
@@ -34,6 +41,16 @@ class Device:
     def __post_init__(self) -> None:
         if not self.id:
             self.id = _slug(self.name)
+
+    @property
+    def resolved_omlx_key(self) -> str | None:
+        """Key for omlx calls: dedicated omlx_api_key, else legacy api_key."""
+        return self.omlx_api_key or self.api_key
+
+    @property
+    def resolved_router_key(self) -> str | None:
+        """Key for router calls: dedicated router_api_key, else legacy api_key."""
+        return self.router_api_key or self.api_key
 
     @property
     def macmon_url(self) -> str | None:
@@ -144,6 +161,10 @@ def load(path: str | os.PathLike | None = None) -> Config:
             host_port=d.get("host_port", d.get("disk_port")),
             # Opt-in like comfyui_port: omitted (or 0) → no router polling.
             router_port=d.get("router_port"),
+            # Dedicated keys win; api_key is the deprecated fallback for
+            # both services (see Device.resolved_omlx_key/resolved_router_key).
+            omlx_api_key=d.get("omlx_api_key"),
+            router_api_key=d.get("router_api_key"),
             api_key=d.get("api_key"),
             id=d.get("id"),
         )

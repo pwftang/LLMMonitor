@@ -99,7 +99,7 @@ the Mac — the hub just polls the REST API ComfyUI already serves.
 A machine running [omlx-router](https://github.com/pwftang/omlx-router) —
 including one that runs nothing else, e.g. a Linux LXC — can be monitored as
 its own device. Add `router_port` to its `[[devices]]` block and set
-`api_key` to the router's Bearer key:
+`router_api_key` to the router's Bearer key:
 
 ```toml
 [[devices]]
@@ -108,12 +108,22 @@ host = "omlx-router.tailc08855.ts.net"
 omlx_port = 0
 macmon_port = 0
 router_port = 8000
-api_key = "your-router-bearer-key"
+router_api_key = "your-router-bearer-key"
 ```
 
-The hub polls the public `/ready` endpoint either way; the key unlocks the
+Keys are per-service and never cross-sent: `omlx_api_key` is only ever used
+for omlx calls, `router_api_key` only for router calls. The old single
+`api_key` still works as a deprecated fallback for whichever service has no
+dedicated key, so existing `hub.toml` files keep working unchanged.
+
+The hub polls `/ready` either way — with a router key it sends it, and the
+authenticated response carries backend detail (engine-pool memory, models)
+that the minimal public body omits; without a key a bare `{"status":
+"ready"}` is still accepted as healthy. The key additionally unlocks the
 `/admin` half (per-deployment request counts, wait-time averages, and the
-routed-requests log). Requests are drained into the hub's SQLite and kept for
+routed-requests log). A 401 from `/admin` never makes a router that answers
+`/ready` look offline — the admin panels are simply omitted. Requests are
+drained into the hub's SQLite and kept for
 `route_event_days` (default 7) in the `[retention]` table. Router panels
 appear only on devices where `router_port` is set; likewise every absent
 source's panels are hidden entirely.

@@ -608,8 +608,15 @@ class DevicePoller:
             return bool(self.state.router_ok)
         self._router_last_poll = now
         was_ok = self.state.router_ok
+        router_key = self.device.resolved_router_key
         try:
-            r = await self._router_get("/ready", auth=False, raise_on_status=False)
+            # Send the router key on /ready when we have one: the authenticated
+            # response carries backend detail (engine_pool, models) that the
+            # minimal public body omits. Without a key, a minimal
+            # {"status": "ready"} is still accepted as healthy.
+            r = await self._router_get(
+                "/ready", auth=bool(router_key), raise_on_status=False
+            )
             ready_body = r.json()
             if not isinstance(ready_body, dict):
                 raise ValueError("router /ready returned non-object payload")
@@ -626,7 +633,7 @@ class DevicePoller:
         series = extract_router_ready(ready_body)
         stats_body: dict | None = None
         models_body: dict | None = None
-        if self.device.api_key:
+        if router_key:
             try:
                 stats_r, models_r = await asyncio.gather(
                     self._router_get("/admin/api/stats"),
@@ -653,7 +660,7 @@ class DevicePoller:
             "models": models_body,
         }
         self.store.insert(self.device.id, time.time(), "router", series)
-        if self.device.api_key and stats_body is not None:
+        if router_key and stats_body is not None:
             try:
                 req_r = await self._router_get("/admin/api/requests", params={"limit": 100})
                 req_body = req_r.json()
@@ -675,14 +682,15 @@ class DevicePoller:
         raise_on_status: bool = True,
         params: dict | None = None,
     ) -> httpx.Response:
-        """GET against the router. Bearer header uses device.api_key verbatim —
-        that key is router-only by design (omlx and comfyui use their own
-        login flows), so there's no header collision on a dual-purpose box."""
+        """GET against the router. Bearer header uses the resolved router key
+        (router_api_key, else the deprecated api_key fallback) verbatim — the
+        omlx key is never sent here, and vice versa (see _omlx_get)."""
         assert self._client is not None and self.device.router_url is not None
         url = self.device.router_url + path
         headers = {}
-        if auth and self.device.api_key:
-            headers["Authorization"] = f"Bearer {self.device.api_key}"
+        key = self.device.resolved_router_key
+        if auth and key:
+            headers["Authorization"] = f"Bearer {key}"
         r = await self._client.get(url, headers=headers, params=params)
         if raise_on_status:
             r.raise_for_status()
@@ -878,10 +886,13 @@ class DevicePoller:
         assert self._client is not None and self.device.omlx_base is not None
         url = self.device.omlx_base + path
         r = await self._client.get(url)
-        if r.status_code == 401 and self.device.api_key:
+        # omlx key resolution: dedicated omlx_api_key, else the deprecated
+        # api_key fallback. The router key is never sent to omlx.
+        key = self.device.resolved_omlx_key
+        if r.status_code == 401 and key:
             login = await self._client.post(
                 self.device.omlx_base + "/admin/api/login",
-                json={"api_key": self.device.api_key},
+                json={"api_key": key},
             )
             login.raise_for_status()
             r = await self._client.get(url)
