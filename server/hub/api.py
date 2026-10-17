@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import Config
 from .db import Store
 from .poll import DevicePoller, DeviceState
+from .rack import build_rack
 
 log = logging.getLogger("hub.api")
 
@@ -113,9 +114,24 @@ def create_app(cfg: Config, store: Store, states: dict[str, DeviceState], *, sta
             raise HTTPException(404, f"unknown device: {dev_id}")
         return JSONResponse({"device": dev_id, "events": store.recent_events(dev_id, limit)})
 
+    @app.get("/api/rack")
+    async def rack() -> JSONResponse:
+        """Compact rack-dashboard snapshot. Aggregates ONLY in-memory device
+        state and the hub's own SQLite (route events) — zero upstream
+        network calls, so it is cheap enough for a kiosk to poll."""
+        return JSONResponse(build_rack(states, store))
+
     web_dir = cfg.web_dir or cfg.default_web_dir()
     index = Path(web_dir) / "index.html"
     if index.exists():
+        rack_html = Path(web_dir) / "rack.html"
+        if rack_html.exists():
+
+            @app.get("/rack", include_in_schema=False)
+            async def rack_page() -> FileResponse:
+                return FileResponse(str(rack_html),
+                                    headers={"Cache-Control": "no-cache"})
+
         app.mount("/", _NoCacheStaticFiles(directory=str(web_dir), html=True), name="web")
     else:
         @app.get("/")

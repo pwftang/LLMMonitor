@@ -157,6 +157,23 @@ podman run -d -p 8400:8400 -v llmmonitor-data:/data llmmonitor
 Put your filled-in `hub.toml` on the `/data` volume. The SQLite database lives
 beside it by default (`data_dir`), so the volume is a complete backup.
 
+## Rack dashboard kiosk (`/rack`)
+
+`GET /rack` serves a compact 1280x400 view designed for a small wall-mounted
+kiosk (e.g. a Raspberry Pi 3B driving a 1280x400 panel). The Pi is a dumb
+renderer only: it polls `GET /api/rack` every 5 s and patches text. All
+aggregation happens in the hub — `/api/rack` is built purely from the hub's
+in-memory device state and its own SQLite, with zero upstream calls, so kiosk
+refreshes never fan out to the Macs. Values carry explicit ages; stale,
+offline, and never-observed data are labelled as such and never shown as live.
+
+Point Chromium at the hub in kiosk mode (substitute your hub's address):
+
+```sh
+chromium-browser --kiosk --noerrdialogs --disable-infobars \
+  --check-for-update-interval=31536000 http://HUB_HOST:8400/rack
+```
+
 ## Data & retention
 
 - `samples` — raw 2 s metrics, kept for `full_res_hours` (default 24 h)

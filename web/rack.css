@@ -1,0 +1,218 @@
+/* LLMMonitor rack dashboard — dedicated 1280x400 kiosk view.
+   No charts, no frameworks; reuses styles.css theme variables + Inter.
+   Everything fits 1280x400 with no scrolling: fixed-height flex columns,
+   text truncation instead of overflow. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;            /* kiosk: never scroll, ever */
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Inter", system-ui, sans-serif;
+}
+
+#rack {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 8px 12px 10px;
+  box-sizing: border-box;
+  gap: 8px;
+}
+
+/* ---------- top bar ---------- */
+#rack-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 30px;
+}
+#rack-bar .logo { color: var(--text-3); font-size: 16px; }
+.rack-title {
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.14em;
+}
+.rack-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.rack-pill.live   { color: var(--green); border-color: var(--green); }
+.rack-pill.stale  { color: var(--amber); border-color: var(--amber); }
+.rack-pill.offline,
+.rack-pill.err    { color: var(--red);   border-color: var(--red); }
+.rack-pill .dim { color: var(--text-3); font-weight: 500; }
+#rack-bar .spacer { flex: 1; }
+.rack-clock {
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+/* ---------- server panels ---------- */
+#rack-servers {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+
+.srv {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 10px 14px;
+  box-sizing: border-box;
+  gap: 6px;
+  overflow: hidden;
+}
+
+/* The serving box gets a stronger frame; idle/backup stays quiet. */
+.srv.active {
+  border: 2px solid var(--green);
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.12);
+}
+.srv.offline { opacity: 0.55; }
+.srv.stale   { border-color: var(--amber); }
+
+.srv-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.srv-name {
+  font-size: 17px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.srv-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: var(--bg);
+  background: var(--green);
+  flex: 0 0 auto;
+}
+.srv-badge.idle    { background: var(--surface-soft); color: var(--text-3); }
+.srv-badge.stale   { background: var(--amber); }
+.srv-badge.offline { background: var(--red); color: #fff; }
+.srv-age {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+.srv-age.stale { color: var(--amber); }
+
+.srv-model {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.srv-model .k { color: var(--text-3); }
+
+/* Big numbers row — the at-a-glance layer. */
+.srv-stats {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stat {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.stat .v {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.stat .v.hot  { color: var(--amber); }
+.stat .v.crit { color: var(--red); }
+.stat .k {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.stat .a {
+  font-size: 10px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.stat .a.stale { color: var(--amber); }
+
+/* Bottom strip — memory bar + last routing decision. */
+.srv-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-2);
+  min-width: 0;
+}
+.membar {
+  flex: 0 0 110px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-soft);
+  overflow: hidden;
+}
+.membar > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--green);
+  border-radius: 3px;
+  transition: width 0.6s ease;
+}
+.membar > i.warn { background: var(--amber); }
+.membar > i.crit { background: var(--red); }
+.srv-decision {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-3);
+}
+.srv-decision b { color: var(--text-2); font-weight: 600; }

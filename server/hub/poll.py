@@ -366,6 +366,9 @@ class DeviceState:
         self.online = False
         self.last_error: str | None = None
         self.last_seen: float | None = None
+        # Wallclock of the last poll attempt, success or not; None until the
+        # first attempt (see rack.py: offline vs unknown).
+        self.last_attempt: float | None = None
         self.pressure_level: str | None = None
         self.omlx_version: str | None = None
         self.tailscale_ip: str | None = None
@@ -378,21 +381,31 @@ class DeviceState:
         self.host_ok: bool | None = None
         self.router_ok: bool | None = None
         self.router_auth_ok: bool | None = None
+        # Wallclock of the last successful router poll (see llm_updated_at).
+        self.router_updated_at: float | None = None
         # Live render progress pushed by the ComfyUI /ws watch loop:
         # {"step", "total", "node", "started_at", "elapsed_s"} while running.
         self.comfy_progress: dict[str, Any] | None = None
         self.system: dict[str, float] = {}
         self.llm: dict[str, float] = {}
+        # Wallclock of the last successful omlx stats tick — lets consumers
+        # stamp llm.* values with an explicit freshness instead of implying
+        # a historical value is live.
+        self.llm_updated_at: float | None = None
         self.raw: dict[str, Any] = {}
 
     def mark_offline(self, err: str) -> None:
         self.online = False
         self.last_error = err
+        # A failed poll is still an attempt: it distinguishes "unreachable"
+        # from "never polled" for consumers like the rack view.
+        self.last_attempt = time.time()
 
     def mark_ok(self) -> None:
         self.online = True
         self.last_error = None
         self.last_seen = time.time()
+        self.last_attempt = self.last_seen
 
     def public(self) -> dict:
         base = self.device.omlx_base
@@ -630,6 +643,7 @@ class DevicePoller:
         if was_ok is False:
             log.info("%s router recovered", self.device.id)
         self.state.router_ok = True
+        self.state.router_updated_at = time.time()
         series = extract_router_ready(ready_body)
         stats_body: dict | None = None
         models_body: dict | None = None
@@ -875,6 +889,7 @@ class DevicePoller:
             return False
         series = extract_omlx_stats(payload)
         self.state.llm = series
+        self.state.llm_updated_at = time.time()
         self.state.pressure_level = (
             payload.get("pressure_level") if isinstance(payload, dict) else None
         )

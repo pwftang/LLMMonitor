@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1280, initial-scale=1">
+  <title>LLMMonitor — Rack</title>
+  <script>
+    // Kiosk default: dark unless the operator explicitly saved light theme.
+    (function () {
+      var t = localStorage.getItem("llmmonitor-theme");
+      document.documentElement.dataset.theme = t === "light" ? "light" : "dark";
+    })();
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/rack.css">
+</head>
+<body id="rack-body">
+  <div id="rack">
+    <header id="rack-bar">
+      <span class="logo">⬡</span>
+      <span class="rack-title">RACK</span>
+      <span id="rack-overall" class="rack-pill">connecting…</span>
+      <span id="rack-router" class="rack-pill router"></span>
+      <span class="spacer"></span>
+      <span id="rack-clock" class="rack-clock"></span>
+    </header>
+    <main id="rack-servers"></main>
+  </div>
+  <script type="module" src="/rack.js"></script>
+</body>
+</html>
