@@ -202,13 +202,22 @@ def extract_model_series(models: list | dict) -> dict[str, float]:
 
 # ---- omlx-router extraction ----------------------------------------------------
 
+def _num(v: Any) -> bool:
+    """True for real numeric values; bool is excluded (JSON true/false are not counts)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def extract_router_ready(p: dict) -> dict[str, float]:
     """Router /ready payload → router.* series.
 
     /ready returns 200 with status="ready" OR 503 with status="not_ready" —
-    both carry the full backends map, so treat *any* well-formed body as a
-    healthy poll: the router is "up" even when no backend is currently
-    routable. Callers must NOT raise_for_status on this endpoint.
+    treat *any* well-formed body as a healthy poll: the router is "up" even
+    when no backend is currently routable. Callers must NOT
+    raise_for_status on this endpoint.
+
+    The unauthenticated /ready may be minimal: {"status": "ready"} with no
+    backends field at all. Absent backends is *unknown*, not zero — emit no
+    router.backends_healthy in that case (missing series render as gaps).
     """
     out: dict[str, float] = {}
     status = p.get("status")
@@ -216,28 +225,30 @@ def extract_router_ready(p: dict) -> dict[str, float]:
         return out
     out["router.status_ready"] = 1.0 if status == "ready" else 0.0
     backends = p.get("backends")
+    if not isinstance(backends, dict):
+        # No backends supplied → health counts are unknown, not zero.
+        return out
     healthy_n = 0
-    if isinstance(backends, dict):
-        for name, b in backends.items():
-            if not isinstance(b, dict):
-                continue
-            slug = _slug(name)
-            if not slug:
-                continue
-            healthy = 1.0 if b.get("healthy") else 0.0
-            healthy_n += int(healthy)
-            out[f"router.backend.{slug}.healthy"] = healthy
-            ep = b.get("engine_pool")
-            if isinstance(ep, dict):
-                mem = ep.get("model_memory_bytes")
-                if isinstance(mem, (int, float)):
-                    out[f"router.backend.{slug}.model_mem_gb"] = _gb(mem)
-                head = ep.get("memory_headroom_bytes")
-                if isinstance(head, (int, float)):
-                    out[f"router.backend.{slug}.mem_headroom_gb"] = _gb(head)
-                loaded = ep.get("loaded_model_count")
-                if isinstance(loaded, (int, float)):
-                    out[f"router.backend.{slug}.loaded_models"] = float(loaded)
+    for name, b in backends.items():
+        if not isinstance(b, dict):
+            continue
+        slug = _slug(name)
+        if not slug:
+            continue
+        healthy = 1.0 if b.get("healthy") else 0.0
+        healthy_n += int(healthy)
+        out[f"router.backend.{slug}.healthy"] = healthy
+        ep = b.get("engine_pool")
+        if isinstance(ep, dict):
+            mem = ep.get("model_memory_bytes")
+            if _num(mem):
+                out[f"router.backend.{slug}.model_mem_gb"] = _gb(mem)
+            head = ep.get("memory_headroom_bytes")
+            if _num(head):
+                out[f"router.backend.{slug}.mem_headroom_gb"] = _gb(head)
+            loaded = ep.get("loaded_model_count")
+            if _num(loaded):
+                out[f"router.backend.{slug}.loaded_models"] = float(loaded)
     out["router.backends_healthy"] = float(healthy_n)
     return out
 
@@ -247,27 +258,70 @@ def extract_router_admin(stats: dict, models: dict) -> dict[str, float]:
 
     These endpoints require the router's Bearer key; absent the key (or a
     401) the caller simply skips this extractor entirely.
+
+    Current contract:
+      stats.workload — mapping of deployment name → {"active": n,
+        "latest_estimated_finish_seconds": ...}; router.inflight is the sum
+        of numeric active values. Older shape ({"active": n, "completed": c,
+        "failed": f}) stays supported.
+      stats.metrics.total_requests — router.total_requests. Older shape
+        falls back to completed + failed.
+      stats.wait_metrics.outcomes — rows of {"requests": n,
+        "average_waited_seconds": s}; router.wait_avg_s is the
+        request-weighted mean over valid samples. Older scalar
+        avg/mean/avg_wait_s stays supported.
+    Unknown/invalid values are omitted, never coerced to 0.
     """
     out: dict[str, float] = {}
     workload = stats.get("workload")
-    total_requests = 0
     if isinstance(workload, dict):
         active = workload.get("active")
-        if isinstance(active, (int, float)):
+        if _num(active):
+            # Legacy shape: a flat counter object.
             out["router.inflight"] = float(active)
-        completed = workload.get("completed")
-        if isinstance(completed, (int, float)):
-            total_requests += int(completed)
-        failed = workload.get("failed")
-        if isinstance(failed, (int, float)):
-            total_requests += int(failed)
-    if total_requests:
-        out["router.total_requests"] = float(total_requests)
+        else:
+            # Current shape: deployment name → workload object.
+            total = 0.0
+            seen = False
+            for entry in workload.values():
+                if isinstance(entry, dict) and _num(entry.get("active")):
+                    total += float(entry["active"])
+                    seen = True
+            if seen:
+                out["router.inflight"] = total
+    metrics = stats.get("metrics")
+    if isinstance(metrics, dict) and _num(metrics.get("total_requests")):
+        out["router.total_requests"] = float(metrics["total_requests"])
+    elif isinstance(workload, dict):
+        # Legacy fallback: total = completed + failed.
+        total_requests = 0
+        for key in ("completed", "failed"):
+            v = workload.get(key)
+            if _num(v):
+                total_requests += int(v)
+        if total_requests:
+            out["router.total_requests"] = float(total_requests)
     wait = stats.get("wait_metrics")
     if isinstance(wait, dict):
-        avg = wait.get("avg") or wait.get("mean") or wait.get("avg_wait_s")
-        if isinstance(avg, (int, float)):
-            out["router.wait_avg_s"] = float(avg)
+        outcomes = wait.get("outcomes")
+        if isinstance(outcomes, dict):
+            outcomes = list(outcomes.values())
+        if isinstance(outcomes, list):
+            num = 0.0
+            den = 0.0
+            for row in outcomes:
+                if not isinstance(row, dict):
+                    continue
+                n, avg = row.get("requests"), row.get("average_waited_seconds")
+                if _num(n) and _num(avg) and n >= 0:
+                    num += float(n) * float(avg)
+                    den += float(n)
+            if den > 0:
+                out["router.wait_avg_s"] = num / den
+        if "router.wait_avg_s" not in out:
+            avg = wait.get("avg") or wait.get("mean") or wait.get("avg_wait_s")
+            if _num(avg):
+                out["router.wait_avg_s"] = float(avg)
     deps = models.get("deployments")
     if isinstance(deps, dict):
         for name, d in deps.items():

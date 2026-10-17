@@ -144,6 +144,22 @@ ROUTER_STATS = {
     "wait_metrics": {"avg": 1.4},
 }
 
+# Current router contract: workload is deployment → object; totals live in
+# stats.metrics; wait outcomes are per-outcome rows.
+ROUTER_STATS_V2 = {
+    "workload": {
+        "auto-quality": {"active": 2, "latest_estimated_finish_seconds": 12.5},
+        "auto-cheap": {"active": 3, "latest_estimated_finish_seconds": None},
+    },
+    "metrics": {"total_requests": 2010, "prompt_tokens": 999},
+    "wait_metrics": {
+        "outcomes": [
+            {"outcome": "served", "requests": 900, "average_waited_seconds": 2.0},
+            {"outcome": "failed", "requests": 100, "average_waited_seconds": 10.0},
+        ],
+    },
+}
+
 # omlx-router /admin/api/models (Bearer-protected). Only the keys we extract.
 ROUTER_MODELS = {
     "profiles": {},
@@ -395,6 +411,73 @@ class TestExtractRouter:
         assert extract_router_admin({}, {}) == {}
         m = extract_router_admin({"workload": {"active": 3}}, {"deployments": {}})
         assert m == {"router.inflight": 3.0}
+
+    def test_ready_minimal_body_omits_backend_counts(self):
+        # Unauthenticated /ready may carry only {"status": "ready"}.
+        # Absent backends is unknown — must NOT become 0 healthy backends.
+        m = extract_router_ready({"status": "ready"})
+        assert m == {"router.status_ready": 1.0}
+        assert "router.backends_healthy" not in m
+        m = extract_router_ready({"status": "not_ready"})
+        assert m == {"router.status_ready": 0.0}
+        assert "router.backends_healthy" not in m
+
+    def test_ready_empty_backends_dict_is_known_zero(self):
+        # backends supplied but empty is a real zero, distinct from absent.
+        m = extract_router_ready({"status": "ready", "backends": {}})
+        assert m["router.backends_healthy"] == 0.0
+
+    def test_admin_v2_workload_mapping_and_metrics(self):
+        m = extract_router_admin(ROUTER_STATS_V2, ROUTER_MODELS)
+        # inflight = 2 + 3 summed across deployments.
+        assert m["router.inflight"] == 5.0
+        assert m["router.total_requests"] == 2010.0
+        # weighted: (900*2.0 + 100*10.0) / 1000 = 2.8
+        assert m["router.wait_avg_s"] == pytest.approx(2.8)
+        # deployments still come from /admin/api/models.
+        assert m["router.dep.auto-quality.active"] == 1.0
+        assert m["router.dep.auto-cheap.active"] == 1.0
+
+    def test_admin_v2_partial_and_invalid_fields(self):
+        # Non-numeric / bool / missing actives are skipped, not zero-filled.
+        stats = {
+            "workload": {
+                "a": {"active": 1},
+                "b": {"active": None},
+                "c": {"active": True},
+                "d": {},
+                "e": "garbage",
+            },
+            "metrics": {"total_requests": "nope"},
+            "wait_metrics": {"outcomes": [{"requests": 0}, {"nope": 1}]},
+        }
+        m = extract_router_admin(stats, {})
+        assert m == {"router.inflight": 1.0}
+
+    def test_admin_wait_outcomes_no_valid_samples_falls_back_then_omits(self):
+        # Zero-request rows give no weighted average; legacy scalar still used.
+        stats = {
+            "wait_metrics": {
+                "outcomes": [{"requests": 0, "average_waited_seconds": 5.0}],
+                "avg": 1.1,
+            },
+        }
+        m = extract_router_admin(stats, {})
+        assert m["router.wait_avg_s"] == pytest.approx(1.1)
+        # No outcomes and no scalar → key omitted entirely.
+        m = extract_router_admin({"wait_metrics": {"outcomes": []}}, {})
+        assert "router.wait_avg_s" not in m
+
+    def test_admin_v2_takes_precedence_over_legacy_totals(self):
+        # Hybrid payload during migration: legacy flat workload counters plus
+        # the new metrics.total_requests — the new field wins for the total.
+        stats = {
+            "workload": {"active": 2, "completed": 1432, "failed": 8},
+            "metrics": {"total_requests": 2010},
+        }
+        m = extract_router_admin(stats, {})
+        assert m["router.total_requests"] == 2010.0
+        assert m["router.inflight"] == 2.0
 
 
 class TestStore:
