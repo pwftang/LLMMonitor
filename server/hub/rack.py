@@ -91,67 +91,17 @@ def _server_row(state: DeviceState, store: Store, now: float, stale_after_s: flo
                     loaded_age = llm_age  # stamped by the models loop, ~llm cadence
                     break
 
-    # Last routing decision: newest sanitized route event in the hub's DB.
-    last_decision: dict | None = None
-    try:
-        events = store.recent_events(state.device.id, 10)
-    except Exception:  # pragma: no cover — defensive; DB read shouldn't raise
-        events = []
-    for ev in events:
-        dep = ev.get("deployment")
-        if isinstance(dep, str) and dep:
-            last_decision = {
-                "deployment": dep,
-                "ts": ev.get("recorded_at"),
-                "age_s": _age(now, ev.get("recorded_at")),
-                "status_code": ev.get("status_code")
-                if isinstance(ev.get("status_code"), (int, float))
-                else None,
-            }
-            break
-
-    # "Active" = this server is the one serving right now: the newest routed
-    # decision landed on it, or it has requests in flight. Deliberately
-    # conservative: never active while offline/stale.
+    # "Active" = this server is serving right now, judged ONLY from fresh live
+    # per-server active_requests. Route events belong to the router device, not
+    # to servers, and deployment names are not device ids: there is no reliable
+    # deployment→device mapping in the hub state, so we never guess one and no
+    # per-server last_decision is emitted. Never active while offline/stale.
     active_requests = _num(llm, "llm.active_reqs")
     active = bool(
         inference
         and status == "live"
-        and ((active_requests or 0) > 0
-             or (last_decision is not None and last_decision["deployment"] == state.device.id))
+        and (active_requests or 0) > 0
     )
-
-    router: dict | None = None
-    if state.device.router_url is not None:
-        ready_status: str | None = None
-        if isinstance(raw_router, dict):
-            rs = (raw_router.get("ready") or {}).get("status")
-            if isinstance(rs, str):
-                ready_status = rs
-        # Recent average queue wait (router wait_metrics), a TTFT proxy. It
-        # lives only in the store's router series; take the newest point in
-        # the last hour and stamp its real age — never presented as a live
-        # per-request TTFT.
-        wait_avg: float | None = None
-        wait_age: float | None = None
-        try:
-            pts = store.history(
-                state.device.id, ["router.wait_avg_s"], now - 3600, now
-            ).get("router.wait_avg_s") or []
-            if pts:
-                wait_ts, wait_avg = pts[-1]
-                wait_age = _age(now, wait_ts)
-        except Exception:  # pragma: no cover — defensive DB read
-            pass
-        router = {
-            "configured": True,
-            "ok": state.router_ok,
-            "ready": ready_status,
-            "auth_ok": state.router_auth_ok,
-            "wait_avg_s": wait_avg,
-            "wait_avg_age_s": wait_age,
-            "age_s": router_age,
-        }
 
     return {
         "id": state.device.id,
@@ -174,9 +124,32 @@ def _server_row(state: DeviceState, store: Store, now: float, stale_after_s: flo
         "pressure_level": state.pressure_level,
         "mem_pressure_pct": _num(system, "sys.mem_pressure_pct"),
         "mem_pressure_age_s": _age(now, state.macmon_last_ok),
-        "last_decision": last_decision,
-        "router": router,
     }
+
+
+def _last_decision(store: Store, device_id: str, now: float) -> dict | None:
+    """Newest sanitized routing decision from a router device's event store.
+
+    Route events are drained from the router's admin API, so they live under
+    the router device's id — never a server's. Only deployment, status code,
+    and honest timestamps are echoed; no request ids, prompts, or payloads.
+    """
+    try:
+        events = store.recent_events(device_id, 10)
+    except Exception:  # pragma: no cover — defensive; DB read shouldn't raise
+        return None
+    for ev in events:
+        dep = ev.get("deployment")
+        if isinstance(dep, str) and dep:
+            return {
+                "deployment": dep,
+                "ts": ev.get("recorded_at"),
+                "age_s": _age(now, ev.get("recorded_at")),
+                "status_code": ev.get("status_code")
+                if isinstance(ev.get("status_code"), (int, float))
+                else None,
+            }
+    return None
 
 
 def build_rack(
@@ -188,9 +161,12 @@ def build_rack(
 ) -> dict:
     """Aggregate the rack snapshot. Pure: reads memory + SQLite only."""
     now = time.time() if now is None else now
+    # Server panels = inference servers only (omlx enabled). Router-only LXC
+    # devices and monitor-only devices are real devices but never panels.
     servers = [
         _server_row(states[k], store, now, stale_after_s)
         for k in sorted(states)
+        if states[k].device.omlx_base is not None
     ]
 
     seen_ages = [s["last_seen_age_s"] for s in servers if s["last_seen_age_s"] is not None]
@@ -207,12 +183,52 @@ def build_rack(
     else:
         overall = "live"
 
+    # Router health comes from ANY router-configured state — normally a
+    # dedicated router-only device, but a Mac that co-hosts the router still
+    # works. Prefer a state whose router poll succeeded, tie-break on the
+    # newest router_updated_at so the freshest view wins.
+    router_states = [
+        states[k] for k in sorted(states)
+        if states[k].device.router_url is not None
+    ]
     router: dict = {"configured": False, "ok": None, "ready": None,
-                    "auth_ok": None, "age_s": None}
-    for s in servers:
-        if s["router"] and (router["ok"] is not True):
-            router = s["router"]
-    router = dict(router)
+                    "auth_ok": None, "age_s": None, "last_decision": None}
+    if router_states:
+        best = max(
+            router_states,
+            key=lambda st: (bool(st.router_ok), st.router_updated_at or 0.0),
+        )
+        raw_router = best.raw.get("router")
+        ready_status: str | None = None
+        if isinstance(raw_router, dict):
+            rs = (raw_router.get("ready") or {}).get("status")
+            if isinstance(rs, str):
+                ready_status = rs
+        # Recent average queue wait (router wait_metrics), a TTFT proxy. It
+        # lives only in the store's router series; take the newest point in
+        # the last hour and stamp its real age — never presented as a live
+        # per-request TTFT.
+        wait_avg: float | None = None
+        wait_age: float | None = None
+        try:
+            pts = store.history(
+                best.device.id, ["router.wait_avg_s"], now - 3600, now
+            ).get("router.wait_avg_s") or []
+            if pts:
+                wait_ts, wait_avg = pts[-1]
+                wait_age = _age(now, wait_ts)
+        except Exception:  # pragma: no cover — defensive DB read
+            pass
+        router = {
+            "configured": True,
+            "ok": best.router_ok,
+            "ready": ready_status,
+            "auth_ok": best.router_auth_ok,
+            "wait_avg_s": wait_avg,
+            "wait_avg_age_s": wait_age,
+            "age_s": _age(now, best.router_updated_at),
+            "last_decision": _last_decision(store, best.device.id, now),
+        }
     router["stale_after_s"] = stale_after_s
 
     return {
