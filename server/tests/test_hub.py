@@ -1080,6 +1080,9 @@ class TestPoller:
                 if request.url.path == "/admin/api/login":
                     seen.append(("login", json.loads(request.content)["api_key"]))
                     return httpx.Response(200, json={"ok": True})
+                if request.url.path == "/admin/api/stats" and ("login", "legacy") not in seen:
+                    # First unauthenticated hit → 401 → login → retry.
+                    return httpx.Response(401)
                 return httpx.Response(200, json=OMLX_STATS)
             if request.url.port == 8100:
                 if request.url.path == "/ready":
