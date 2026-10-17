@@ -45,7 +45,6 @@ function panelHTML() {
     <div class="srv-foot">
       <span class="membar"><i></i></span>
       <span class="srv-mem-p"></span>
-      <span class="srv-decision"></span>
     </div>`;
 }
 
@@ -69,7 +68,6 @@ function buildPanels(servers) {
       model: root.querySelector('[data-f="model"]'),
       membar: root.querySelector(".membar > i"),
       memP: root.querySelector(".srv-mem-p"),
-      decision: root.querySelector(".srv-decision"),
       v: Object.fromEntries(
         ["reqs", "gen", "prefill", "mem"].map((k) => [
           k,
@@ -164,18 +162,10 @@ function render(data) {
     }
     p.membar.style.width = `${w}%`;
     p.membar.className = cls;
-    const d = s.last_decision;
-    p.decision.innerHTML = "";
-    if (d) {
-      const b = document.createElement("b");
-      b.textContent = d.deployment;
-      p.decision.append(
-        "last route → ", b,
-        document.createTextNode(` · ${ago(adj(d.age_s))} ago`),
-      );
-    } else {
-      p.decision.textContent = "no routed requests yet";
-    }
+    // No per-server routing decision: route events belong to the router
+    // device and deployment names are not device ids. The panel state above
+    // (badge/active class) is driven only by server metrics and s.active;
+    // the global last decision lives in the router pill.
   }
 
   const o = data.overall;
@@ -198,6 +188,13 @@ function render(data) {
     bits.push(r.ok === false ? "router down" : r.ready === "ready" ? "router ready" : "router n/r");
     if (r.wait_avg_s != null) bits.push(`wait ${r.wait_avg_s.toFixed(1)}s · ${ago(adj(r.wait_avg_age_s))} ago`);
     if (r.auth_ok === false) bits.push("key needed");
+    // Global last routing decision (router device's newest route event).
+    // Deployment names are NOT device ids: shown as a name only, never
+    // mapped to or highlighted on a server panel.
+    const d = r.last_decision;
+    if (d && typeof d.deployment === "string" && d.deployment) {
+      bits.push(`last route → ${d.deployment} · ${ago(adj(d.age_s))} ago`);
+    }
     routerEl.textContent = bits.join(" · ");
     routerEl.className =
       "rack-pill router " +

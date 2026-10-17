@@ -207,12 +207,3 @@ html, body {
 }
 .membar > i.warn { background: var(--amber); }
 .membar > i.crit { background: var(--red); }
-.srv-decision {
-  flex: 1 1 auto;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--text-3);
-}
-.srv-decision b { color: var(--text-2); font-weight: 600; }
