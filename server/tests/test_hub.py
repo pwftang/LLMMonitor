@@ -144,6 +144,22 @@ ROUTER_STATS = {
     "wait_metrics": {"avg": 1.4},
 }
 
+# Current router contract: workload is deployment → object; totals live in
+# stats.metrics; wait outcomes are per-outcome rows.
+ROUTER_STATS_V2 = {
+    "workload": {
+        "auto-quality": {"active": 2, "latest_estimated_finish_seconds": 12.5},
+        "auto-cheap": {"active": 3, "latest_estimated_finish_seconds": None},
+    },
+    "metrics": {"total_requests": 2010, "prompt_tokens": 999},
+    "wait_metrics": {
+        "outcomes": [
+            {"outcome": "served", "requests": 900, "average_waited_seconds": 2.0},
+            {"outcome": "failed", "requests": 100, "average_waited_seconds": 10.0},
+        ],
+    },
+}
+
 # omlx-router /admin/api/models (Bearer-protected). Only the keys we extract.
 ROUTER_MODELS = {
     "profiles": {},
@@ -395,6 +411,73 @@ class TestExtractRouter:
         assert extract_router_admin({}, {}) == {}
         m = extract_router_admin({"workload": {"active": 3}}, {"deployments": {}})
         assert m == {"router.inflight": 3.0}
+
+    def test_ready_minimal_body_omits_backend_counts(self):
+        # Unauthenticated /ready may carry only {"status": "ready"}.
+        # Absent backends is unknown — must NOT become 0 healthy backends.
+        m = extract_router_ready({"status": "ready"})
+        assert m == {"router.status_ready": 1.0}
+        assert "router.backends_healthy" not in m
+        m = extract_router_ready({"status": "not_ready"})
+        assert m == {"router.status_ready": 0.0}
+        assert "router.backends_healthy" not in m
+
+    def test_ready_empty_backends_dict_is_known_zero(self):
+        # backends supplied but empty is a real zero, distinct from absent.
+        m = extract_router_ready({"status": "ready", "backends": {}})
+        assert m["router.backends_healthy"] == 0.0
+
+    def test_admin_v2_workload_mapping_and_metrics(self):
+        m = extract_router_admin(ROUTER_STATS_V2, ROUTER_MODELS)
+        # inflight = 2 + 3 summed across deployments.
+        assert m["router.inflight"] == 5.0
+        assert m["router.total_requests"] == 2010.0
+        # weighted: (900*2.0 + 100*10.0) / 1000 = 2.8
+        assert m["router.wait_avg_s"] == pytest.approx(2.8)
+        # deployments still come from /admin/api/models.
+        assert m["router.dep.auto-quality.active"] == 1.0
+        assert m["router.dep.auto-cheap.active"] == 1.0
+
+    def test_admin_v2_partial_and_invalid_fields(self):
+        # Non-numeric / bool / missing actives are skipped, not zero-filled.
+        stats = {
+            "workload": {
+                "a": {"active": 1},
+                "b": {"active": None},
+                "c": {"active": True},
+                "d": {},
+                "e": "garbage",
+            },
+            "metrics": {"total_requests": "nope"},
+            "wait_metrics": {"outcomes": [{"requests": 0}, {"nope": 1}]},
+        }
+        m = extract_router_admin(stats, {})
+        assert m == {"router.inflight": 1.0}
+
+    def test_admin_wait_outcomes_no_valid_samples_falls_back_then_omits(self):
+        # Zero-request rows give no weighted average; legacy scalar still used.
+        stats = {
+            "wait_metrics": {
+                "outcomes": [{"requests": 0, "average_waited_seconds": 5.0}],
+                "avg": 1.1,
+            },
+        }
+        m = extract_router_admin(stats, {})
+        assert m["router.wait_avg_s"] == pytest.approx(1.1)
+        # No outcomes and no scalar → key omitted entirely.
+        m = extract_router_admin({"wait_metrics": {"outcomes": []}}, {})
+        assert "router.wait_avg_s" not in m
+
+    def test_admin_v2_takes_precedence_over_legacy_totals(self):
+        # Hybrid payload during migration: legacy flat workload counters plus
+        # the new metrics.total_requests — the new field wins for the total.
+        stats = {
+            "workload": {"active": 2, "completed": 1432, "failed": 8},
+            "metrics": {"total_requests": 2010},
+        }
+        m = extract_router_admin(stats, {})
+        assert m["router.total_requests"] == 2010.0
+        assert m["router.inflight"] == 2.0
 
 
 class TestStore:
@@ -656,7 +739,8 @@ macmon_port = 9091
 
     def test_router_opt_in(self, tmp_path):
         # Router is opt-in like comfyui/hostmon: omitted (or 0) must disable
-        # it, an explicit port enables it. The Bearer key shares api_key.
+        # it, an explicit port enables it. Legacy api_key still resolves as
+        # the router Bearer key.
         (tmp_path / "hub.toml").write_text(
             '[[devices]]\nname = "No Router"\nhost = "a"\n'
             '[[devices]]\nname = "Router"\nhost = "b"\nrouter_port = 8100\napi_key = "rk"\n'
@@ -668,8 +752,32 @@ macmon_port = 9091
         assert no_router.router_port is None and no_router.router_url is None
         assert router.router_url == "http://b:8100"
         assert router.api_key == "rk"
+        assert router.resolved_router_key == "rk"
         assert off.router_port == 0 and off.router_url is None
         assert cfg.retention.route_event_days == 3
+
+    def test_dedicated_api_keys_and_legacy_fallback(self, tmp_path):
+        # omlx_api_key / router_api_key are parsed and resolve per service;
+        # the deprecated api_key fills in only where a dedicated key is
+        # absent, and dedicated keys never cross over.
+        (tmp_path / "hub.toml").write_text(
+            '[[devices]]\nname = "Dedicated"\nhost = "a"\n'
+            'omlx_api_key = "ok"\nrouter_api_key = "rk"\n'
+            '[[devices]]\nname = "Legacy"\nhost = "b"\napi_key = "legacy"\n'
+            '[[devices]]\nname = "Mixed"\nhost = "c"\nomlx_api_key = "ok"\n'
+        )
+        cfg = load(tmp_path / "hub.toml")
+        dedicated, legacy, mixed = cfg.devices
+        assert dedicated.omlx_api_key == "ok" and dedicated.router_api_key == "rk"
+        assert dedicated.api_key is None
+        assert dedicated.resolved_omlx_key == "ok"
+        assert dedicated.resolved_router_key == "rk"
+        # Deprecated fallback: one key serves both services.
+        assert legacy.resolved_omlx_key == "legacy"
+        assert legacy.resolved_router_key == "legacy"
+        # Partial override: dedicated wins for omlx, api_key still backs router.
+        assert mixed.resolved_omlx_key == "ok"
+        assert mixed.resolved_router_key is None
 
     def test_duplicate_ids_rejected(self, tmp_path):
         (tmp_path / "hub.toml").write_text(
@@ -851,9 +959,10 @@ class TestPoller:
         assert state.public()["router_ok"] is True
         assert state.public()["has_router"] is True
         assert state.public()["router_admin_url"] == "http://h:8100/dashboard"
-        # /ready must NOT see the Bearer header (public endpoint), admin must.
-        assert seen_auth[0] is None
-        assert "Bearer rk" in seen_auth[1:]
+        # With a router key, /ready now carries it too (authenticated response
+        # includes backend detail); admin must carry it as well.
+        assert seen_auth[0] == "Bearer rk"
+        assert all(a == "Bearer rk" for a in seen_auth)
         assert state.raw["router"]["ready"] == ROUTER_READY
         store.commit()
         h = store.history("t", ["router.inflight"], time.time() - 10, time.time() + 1)
@@ -896,6 +1005,186 @@ class TestPoller:
         assert state.router_ok is True
         assert state.router_auth_ok is False
         # Ready series still land; admin-only series do not.
+        store.commit()
+        h = store.history("t", ["router.status_ready", "router.inflight"],
+                          time.time() - 10, time.time() + 1)
+        assert h["router.status_ready"]
+        assert h["router.inflight"] == []
+        assert store.recent_events("t", 5) == []
+        store.close()
+
+    async def test_dedicated_keys_never_cross_sent(self):
+        # A dual-purpose device: omlx calls must use omlx_api_key only,
+        # router calls router_api_key only. The deprecated api_key is absent,
+        # so any cross-send would leak one service's key to the other.
+        seen = []  # (port, path, authorization-header-or-None, login-body-key)
+
+        def handler(request):
+            auth = request.headers.get("authorization")
+            body_key = None
+            if request.url.path == "/admin/api/login":
+                body_key = json.loads(request.content)["api_key"]
+            if request.url.port == 8000:
+                seen.append((8000, request.url.path, auth, body_key))
+                if request.url.path == "/admin/api/stats" and body_key is None:
+                    # First unauthenticated hit → 401 → login → retry.
+                    return httpx.Response(401)
+                if request.url.path == "/admin/api/login":
+                    return httpx.Response(200, json={"ok": True})
+                return httpx.Response(200, json=OMLX_STATS)
+            if request.url.port == 8100:
+                seen.append((8100, request.url.path, auth, None))
+                if request.url.path == "/ready":
+                    return httpx.Response(200, json=ROUTER_READY)
+                if request.url.path == "/admin/api/stats":
+                    return httpx.Response(200, json=ROUTER_STATS)
+                if request.url.path == "/admin/api/models":
+                    return httpx.Response(200, json=ROUTER_MODELS)
+                if request.url.path == "/admin/api/requests":
+                    return httpx.Response(200, json=ROUTER_REQUESTS)
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=8000, macmon_port=None,
+            router_port=8100, omlx_api_key="omlx-secret", router_api_key="router-secret",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        poller._router_last_poll = 0  # step past the throttle, as the clock would
+        assert await poller._tick_fast() is True
+        await asyncio.sleep(0)  # drain any spawned task
+
+        assert state.online and state.router_ok and state.router_auth_ok
+        omlx_calls = [c for c in seen if c[0] == 8000]
+        router_calls = [c for c in seen if c[0] == 8100]
+        assert omlx_calls and router_calls
+        # omlx: the router key never appears — not as a header, not in login.
+        assert all(c[2] != "Bearer router-secret" for c in omlx_calls)
+        assert all(c[3] != "router-secret" for c in omlx_calls)
+        login = [c for c in omlx_calls if c[1] == "/admin/api/login"]
+        assert login and login[0][3] == "omlx-secret"
+        # router: the omlx key never appears; admin calls carry the router key.
+        assert all(c[2] != "Bearer omlx-secret" for c in router_calls)
+        admin = [c for c in router_calls if c[1].startswith("/admin/")]
+        assert admin and all(c[2] == "Bearer router-secret" for c in admin)
+        store.close()
+
+    async def test_legacy_api_key_falls_back_to_both_services(self):
+        # Pre-split configs: one api_key must still authenticate omlx login
+        # and the router Bearer header.
+        seen = []
+
+        def handler(request):
+            auth = request.headers.get("authorization")
+            if request.url.port == 8000:
+                if request.url.path == "/admin/api/login":
+                    seen.append(("login", json.loads(request.content)["api_key"]))
+                    return httpx.Response(200, json={"ok": True})
+                if request.url.path == "/admin/api/stats" and ("login", "legacy") not in seen:
+                    # First unauthenticated hit → 401 → login → retry.
+                    return httpx.Response(401)
+                return httpx.Response(200, json=OMLX_STATS)
+            if request.url.port == 8100:
+                if request.url.path == "/ready":
+                    return httpx.Response(200, json=ROUTER_READY)
+                seen.append(("router", auth))
+                if request.url.path == "/admin/api/stats":
+                    return httpx.Response(200, json=ROUTER_STATS)
+                if request.url.path == "/admin/api/models":
+                    return httpx.Response(200, json=ROUTER_MODELS)
+                if request.url.path == "/admin/api/requests":
+                    return httpx.Response(200, json=ROUTER_REQUESTS)
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=8000, macmon_port=None,
+            router_port=8100, api_key="legacy",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        poller._router_last_poll = 0
+        assert await poller._tick_fast() is True
+        assert state.router_auth_ok is True
+        assert ("login", "legacy") in seen
+        assert ("router", "Bearer legacy") in seen
+        store.close()
+
+    async def test_router_minimal_public_readiness(self):
+        # No router key: /ready is called unauthenticated and a minimal
+        # {"status": "ready"} body (no backends) is accepted — the device is
+        # online, router_auth_ok stays None (not probed), and backend counts
+        # are unknown rather than zero.
+        seen_auth = []
+
+        def handler(request):
+            seen_auth.append(request.headers.get("authorization"))
+            return httpx.Response(200, json={"status": "ready"})
+
+        dev = Device(name="T", host="h", omlx_port=None, macmon_port=None, router_port=8100)
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert state.online
+        assert state.router_ok is True
+        assert state.router_auth_ok is None
+        assert set(seen_auth) == {None}
+        store.commit()
+        h = store.history("t", ["router.status_ready", "router.backends_healthy"],
+                          time.time() - 10, time.time() + 1)
+        assert h["router.status_ready"][-1][1] == 1.0
+        assert h["router.backends_healthy"] == []
+        store.close()
+
+    async def test_router_authenticated_readiness_gets_backend_detail(self):
+        # With a router key, /ready itself carries the Bearer header so the
+        # response can include backend detail the public body omits.
+        seen = []
+
+        def handler(request):
+            auth = request.headers.get("authorization")
+            if request.url.path == "/ready":
+                seen.append(auth)
+                if auth == "Bearer rk":
+                    return httpx.Response(200, json=ROUTER_READY)
+                return httpx.Response(200, json={"status": "ready"})
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None,
+            router_port=8100, router_api_key="rk",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert state.router_ok is True
+        assert seen[0] == "Bearer rk"
+        store.commit()
+        h = store.history("t", ["router.backends_healthy"], time.time() - 10, time.time() + 1)
+        assert h["router.backends_healthy"][-1][1] == 1.0
+        store.close()
+
+    async def test_router_admin_401_with_dedicated_key_not_offline(self):
+        # A 401 from the protected admin API with router_api_key set must not
+        # make the successful public /ready look like an outage: device and
+        # router stay online, admin metrics are simply omitted.
+        def handler(request):
+            if request.url.path == "/ready":
+                return httpx.Response(200, json=ROUTER_READY)
+            if request.url.path.startswith("/admin/"):
+                return httpx.Response(401, json={"error": {"type": "authentication_error"}})
+            return httpx.Response(404)
+
+        dev = Device(
+            name="T", host="h", omlx_port=None, macmon_port=None,
+            router_port=8100, router_api_key="wrong-dedicated",
+        )
+        poller, state, store = self._poller(handler, dev)
+        assert await poller._tick_fast() is True
+        assert state.online
+        assert state.router_ok is True
+        assert state.router_auth_ok is False
+        assert state.public()["router_ok"] is True
+        # Admin bodies omitted; ready series still land.
+        assert state.raw["router"]["stats"] is None
+        assert state.raw["router"]["models"] is None
         store.commit()
         h = store.history("t", ["router.status_ready", "router.inflight"],
                           time.time() - 10, time.time() + 1)
